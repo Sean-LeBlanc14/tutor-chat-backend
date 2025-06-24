@@ -4,6 +4,7 @@ import fitz  # PyMuPDF for PDF text extraction
 import pandas as pd  # For handling CSV and Excel files
 from docx import Document  # For reading .docx Word files
 from pptx import Presentation  # For reading .pptx PowerPoint files
+from collections import defaultdict  # For handling duplicate files
 
 # Set the input and output directories
 INPUT_DIR = r"C:\Users\SeanA\Dr.Mishra-materials"  # Folder containing source files
@@ -11,6 +12,9 @@ OUTPUT_DIR = r"C:\Users\SeanA\TutorChatBot\texts"  # Folder to save extracted .t
 
 # Create the output directory if it doesn't already exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Dictionary to track used filenames and avoid overwriting
+used_names = defaultdict(int)
 
 # Function to extract text from a file based on its extension
 def extract_text(file_path):
@@ -47,7 +51,7 @@ def extract_text(file_path):
             )
 
         # Read plain text directly from config, Python, or PsychoPy experiment files
-        elif ext in ['.conf', '.py', '.psyexp']:
+        elif ext in ['.conf', '.py', '.psyexp', '.txt']:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
 
@@ -66,14 +70,23 @@ def process_folder(input_dir, output_dir):
         for file in files:
             file_path = os.path.join(root, file)
             text = extract_text(file_path)  # Try extracting text
+
             if text.strip():  # Only save non-empty extractions
                 base_name = os.path.splitext(file)[0]  # Get filename without extension
-                out_path = os.path.join(output_dir, base_name + ".txt")  # Build .txt path
+                ext_name = ".txt"
+                final_name = base_name
+
+                # Check for existing filenames and append _1, _2, etc. to avoid overwriting
+                while os.path.exists(os.path.join(output_dir, final_name + ext_name)):
+                    used_names[base_name] += 1
+                    final_name = f"{base_name}_{used_names[base_name]}"
+
+                out_path = os.path.join(output_dir, final_name + ext_name)  # Build final unique path
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(text)
                 print(f"Saved: {out_path}")  # Confirm file was written
             else:
                 print(f"Skipped (empty or unsupported): {file_path}")  # Report skipped file
 
-#Call process folder
+# Call process folder
 process_folder(INPUT_DIR, OUTPUT_DIR)
