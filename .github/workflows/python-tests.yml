@@ -22,4 +22,4 @@ jobs:
         pip install pytest
 
     - name: Run tests
-      run: pytest -
+      run: python -m unittest discover -s tests -p "test_*.py" -v
