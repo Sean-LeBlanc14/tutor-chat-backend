@@ -4,9 +4,9 @@ import faiss
 from sentence_transformers import SentenceTransformer
 
 # Set the input/output file paths
-CHUNK_FILE = r"C:\Users\SeanA\TutorChatBot\chunks.jsonl"         # Path to JSONL file with all text chunks
-INDEX_FILE = r"C:\Users\SeanA\TutorChatBot\chunk_index.faiss"    # Path to save FAISS index
-METADATA_FILE = r"C:\Users\SeanA\TutorChatBot\chunk_metadata.json"  # Path to save metadata for chunks
+CHUNK_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunks.jsonl"         # Path to JSONL file with all text chunks
+INDEX_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunk_index.faiss"    # Path to save FAISS index
+METADATA_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunk_metadata.json"  # Path to save metadata for chunks
 
 # Load the sentence transformer model (MiniLM, fast and lightweight)
 model = SentenceTransformer("all-MiniLM-L6-v2")

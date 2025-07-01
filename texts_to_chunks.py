@@ -2,8 +2,8 @@ import os
 import json
 
 # Parameters
-INPUT_DIR = r"C:\Users\SeanA\TutorChatBot\texts"
-OUTPUT_PATH = r"C:\users\SeanA\TutorChatBot\chunks.json"
+INPUT_DIR = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\texts"
+OUTPUT_PATH = r"C:\users\SeanA\Research Project ChatBot\TutorChatBot\chunks.json"
 CHUNK_SIZE = 500
 OVERLAP = 100
 
