@@ -5,6 +5,7 @@ venv/
 *.txt
 !runtime.txt
 !requirements.txt
+!requirements_full.txt
 *.csv
 *.log
 output/
