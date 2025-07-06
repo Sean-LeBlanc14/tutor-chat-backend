@@ -54,6 +54,63 @@ def extract_text(file_path):
         elif ext in ['.conf', '.py', '.psyexp', '.txt']:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
+            
+        # Attempt to extract text from .jasp file (which is a ZIP archive)
+        elif ext == '.jasp':
+            import zipfile
+            import tempfile
+            import json
+
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        zip_ref.extractall(tmpdir)
+
+                        output_parts = []
+
+                        # Extract data.csv if it exists
+                        csv_path = os.path.join(tmpdir, 'data.csv')
+                        if os.path.exists(csv_path):
+                            df = pd.read_csv(csv_path)
+                            output_parts.append("### Data\n" + df.to_string(index=False))
+
+                        # Extract results.json if it exists
+                        results_path = os.path.join(tmpdir, 'results.json')
+                        if os.path.exists(results_path):
+                            with open(results_path, 'r', encoding='utf-8') as f:
+                                results = json.load(f)
+
+                            # Flatten the results tree into readable lines
+                            def walk_results(obj, path=""):
+                                lines = []
+                                if isinstance(obj, dict):
+                                    for key, val in obj.items():
+                                        lines.extend(walk_results(val, f"{path}/{key}" if path else key))
+                                elif isinstance(obj, list):
+                                    for i, item in enumerate(obj):
+                                        lines.extend(walk_results(item, f"{path}[{i}]"))
+                                else:
+                                    if isinstance(obj, (str, int, float)) and str(obj).strip():
+                                        lines.append(f"{path}: {obj}")
+                                return lines
+
+                            extracted = walk_results(results)
+                            output_parts.append("### Results Summary\n" + "\n".join(extracted[:100]))
+
+                        # Optionally extract log.json (analysis steps)
+                        log_path = os.path.join(tmpdir, 'log.json')
+                        if os.path.exists(log_path):
+                            with open(log_path, 'r', encoding='utf-8') as f:
+                                log = json.load(f)
+                            log_text = json.dumps(log, indent=2)
+                            output_parts.append("### Analysis Log (JSON format)\n" + log_text)
+
+                        return "\n\n".join(output_parts)
+
+            except Exception as e:
+                print(f"[Error] Could not extract .jasp file {file_path}: {e}")
+                return ""
+
 
         # Skip unsupported file types
         else:
