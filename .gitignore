@@ -3,6 +3,7 @@ venv/
 
 # Ignore output and data
 *.txt
+!runtime.txt
 !requirements.txt
 *.csv
 *.log
