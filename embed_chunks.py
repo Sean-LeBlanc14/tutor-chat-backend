@@ -1,43 +1,77 @@
-# Import necessary libraries for JSON handling, FAISS indexing, and embeddings
+# Import necessary libraries for JSON handling, pinecone indexing, and embeddings
 import json
-import faiss
+import os
+from tqdm import tqdm
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+
+#Load API keys from .env
+load_dotenv()
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENV = os.getenv("PINECONE_ENVIRONMENT")
+INDEX_NAME = "tutor-bot-index"
 
 # Set the input/output file paths
 CHUNK_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunks.jsonl"         # Path to JSONL file with all text chunks
-INDEX_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunk_index.faiss"    # Path to save FAISS index
-METADATA_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunk_metadata.json"  # Path to save metadata for chunks
 
 # Load the sentence transformer model (MiniLM, fast and lightweight)
+print("Loading embedding model...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Initialize lists to hold chunk texts and their metadata
-texts = []
-metadata = []
+# Initialize pinecone
+print("Connecting to pinecone...")
+pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# Read all chunks from the .jsonl file
+if INDEX_NAME not in pc.list_indexes().names():
+    print(f"Creating pinecone index '{INDEX_NAME}'...")
+    pc.create_index(
+        name=INDEX_NAME, 
+        dimension=384, 
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
+    )
+
+index = pc.Index(INDEX_NAME)
+
+#Load chunk data
+print("Loading chunk data...")
+texts = []
+ids = []
+metadatas = []
+
 with open(CHUNK_FILE, "r", encoding="utf-8") as f:
     for line in f:
-        obj = json.loads(line) # Load each line as a JSON object
-        texts.append(obj["text"]) # Store the chunk text
-        metadata.append({  # Store chunk metadata
-            "source": obj["source"],
-            "chunk_id": obj["chunk_id"]
+        obj = json.loads(line)
+        text = obj["text"]
+        chunk_id = obj["chunk_id"]
+        source = obj["source"]
+
+        texts.append(text)
+        ids.append(f"chunk-{chunk_id}")
+        metadatas.append({
+            "chunk_id": chunk_id,
+            "source": source,
+            "text": text
         })
 
-# Generate embeddings for all text chunks
-embeddings = model.encode(texts, show_progress_bar=True)
+print("Generating embeddings and uploading to pinecone")
+batch_size = 100
+for i in tqdm(range(0, len(texts), batch_size)):
+    batch_texts = texts[i:i + batch_size]
+    batch_ids = ids[i:i + batch_size]
+    batch_metas = metadatas[i:i + batch_size]
+    batch_vectors = model.encode(batch_texts)
 
-# Create FAISS index and add all embeddings
-dimension = embeddings[0].shape[0] # Get embedding vector size
-index = faiss.IndexFlatL2(dimension) # Use L2 distance index
-index.add(embeddings) # Add all chunk embeddings to the index
+    index.upsert(
+        vectors=[
+            {
+                "id": id,
+                "values": vector.tolist(),
+                "metadata": meta
+            }
+            for id, vector, meta in zip(batch_ids, batch_vectors, batch_metas)
+        ]
+    )
 
-# Save the FAISS index to disk
-faiss.write_index(index, INDEX_FILE)
-
-# Save metadata for lookup and reference during search
-with open(METADATA_FILE, "w", encoding="utf-8") as f:
-    json.dump(metadata, f, indent=2)
-
-print("Embedding and indexing complete.")
+print("All embeddings uploaded to pinecone")
