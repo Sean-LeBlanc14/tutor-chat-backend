@@ -32,5 +32,5 @@ if __name__ == "__main__":
     import uvicorn
     import os
 
-    port = int(os.environ.get("PORT", 8000))  # Railway will inject PORT
+    port = int(os.environ.get("PORT", 8080))  # Railway will inject PORT
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

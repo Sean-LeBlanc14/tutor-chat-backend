@@ -7,8 +7,8 @@ from pptx import Presentation  # For reading .pptx PowerPoint files
 from collections import defaultdict  # For handling duplicate files
 
 # Set the input and output directories
-INPUT_DIR = r"C:\Users\SeanA\Research Project ChatBot\Dr.Mishra-materials"  # Folder containing source files
-OUTPUT_DIR = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\texts"  # Folder to save extracted .txt files
+INPUT_DIR = r"Dr.Mishra-materials"  # Folder containing source files
+OUTPUT_DIR = r"texts"  # Folder to save extracted .txt files
 
 # Create the output directory if it doesn't already exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)

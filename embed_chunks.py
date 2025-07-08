@@ -13,7 +13,7 @@ PINECONE_ENV = os.getenv("PINECONE_ENVIRONMENT")
 INDEX_NAME = "tutor-bot-index"
 
 # Set the input/output file paths
-CHUNK_FILE = r"C:\Users\SeanA\Research Project ChatBot\TutorChatBot\chunks.jsonl"         # Path to JSONL file with all text chunks
+CHUNK_FILE = "chunks.jsonl"         # Path to JSONL file with all text chunks
 
 # Load the sentence transformer model (MiniLM, fast and lightweight)
 print("Loading embedding model...")
