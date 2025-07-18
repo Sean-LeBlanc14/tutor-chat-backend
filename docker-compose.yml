@@ -1,0 +1,30 @@
+
+services:
+  db:
+    image: postgres:16
+    container_name: local_postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: SeanAugust2006!
+      POSTGRES_DB: tutorbot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: .
+    container_name: backend
+    restart: always
+    volumes:
+      - .:/app  # This mounts the current directory to /app inside the container
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:SeanAugust2006!@db:5432/tutorbot
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+volumes:
+  pgdata:
