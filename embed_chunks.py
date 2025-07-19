@@ -1,10 +1,10 @@
-# Import necessary libraries for JSON handling, pinecone indexing, and embeddings
+""" Module embeds each chunk into a Pinecone vector database """
 import json
 import os
 from tqdm import tqdm
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import ServerlessSpec, Pinecone
 
 #Load API keys from .env
 load_dotenv()
@@ -26,8 +26,8 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 if INDEX_NAME not in pc.list_indexes().names():
     print(f"Creating pinecone index '{INDEX_NAME}'...")
     pc.create_index(
-        name=INDEX_NAME, 
-        dimension=384, 
+        name=INDEX_NAME,
+        dimension=384,
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
     )
@@ -56,11 +56,11 @@ with open(CHUNK_FILE, "r", encoding="utf-8") as f:
         })
 
 print("Generating embeddings and uploading to pinecone")
-batch_size = 100
-for i in tqdm(range(0, len(texts), batch_size)):
-    batch_texts = texts[i:i + batch_size]
-    batch_ids = ids[i:i + batch_size]
-    batch_metas = metadatas[i:i + batch_size]
+BATCH_SIZE = 100
+for i in tqdm(range(0, len(texts), BATCH_SIZE)):
+    batch_texts = texts[i:i + BATCH_SIZE]
+    batch_ids = ids[i:i + BATCH_SIZE]
+    batch_metas = metadatas[i:i + BATCH_SIZE]
     batch_vectors = model.encode(batch_texts)
 
     index.upsert(

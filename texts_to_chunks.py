@@ -1,3 +1,4 @@
+""" Module breaks up txt files into chunks to be stored later """
 import os
 import json
 
@@ -8,13 +9,14 @@ CHUNK_SIZE = 500
 OVERLAP = 100
 
 # Function to split text into chunks with overlap
-def split_text(text, chunk_size=500, overlap=100):
-    chunks = []
-    for i in range (0, len(text), chunk_size - overlap):
-        chunk = text[i:i + chunk_size]
-        if chunk.strip():
-            chunks.append(chunk.strip())
-    return chunks
+def split_text(txt, chunk_size=500, overlap=100):
+    """ Handles splitting up the text into 500 word chunks """
+    temp_chunks = []
+    for i in range (0, len(txt), chunk_size - overlap):
+        piece = txt[i:i + chunk_size]
+        if piece.strip():
+            temp_chunks.append(piece.strip())
+    return temp_chunks
 
 # Create and write to JSONL
 with open(OUTPUT_PATH, "w", encoding="utf-8") as out_file:
@@ -24,10 +26,10 @@ with open(OUTPUT_PATH, "w", encoding="utf-8") as out_file:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
                 chunks = split_text(text, CHUNK_SIZE, OVERLAP)
-                for i, chunk in enumerate(chunks):
+                for index, chunk in enumerate(chunks):
                     out_file.write(json.dumps({
                         "source": filename,
-                        "chunk_id": i,
+                        "chunk_id": index,
                         "text": chunk
                     }) + "\n")
 

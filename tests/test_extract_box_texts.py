@@ -1,14 +1,16 @@
+""" Test to make sure  extracting files and converting them to txt works """
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from extract_box_texts import extract_text, process_folder
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 
 
 class TestExtractBoxTexts(unittest.TestCase):
-
+    """ Sets the set up and clean up for the test directories for the unit tests """
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.input_dir = Path(self.temp_dir.name) / "input"
@@ -20,6 +22,7 @@ class TestExtractBoxTexts(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_extract_text_basic_formats(self):
+        """ This is a basic test function with different kinds of files """
         files = {
             "sample.txt": "Hello, this is a plain text file.",
             "config.conf": "debug=true",
@@ -35,6 +38,7 @@ class TestExtractBoxTexts(unittest.TestCase):
             self.assertIn(content, extracted)
 
     def test_process_folder_creates_unique_txt_files(self):
+        """ This is a test to seehow it handles duplicates when it comes to file names """
         # Create two files with the same base name
         file1 = self.input_dir / "duplicate.txt"
         file2 = self.input_dir / "duplicate.conf"

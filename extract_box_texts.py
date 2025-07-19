@@ -1,10 +1,13 @@
-# Import necessary libraries for handling different file types
+""" Module handles extracting different file types and converting to txt """
 import os
+from collections import defaultdict  # For handling duplicate files
+import zipfile
+import tempfile
+import json
 import fitz  # PyMuPDF for PDF text extraction
 import pandas as pd  # For handling CSV and Excel files
 from docx import Document  # For reading .docx Word files
 from pptx import Presentation  # For reading .pptx PowerPoint files
-from collections import defaultdict  # For handling duplicate files
 
 # Set the input and output directories
 INPUT_DIR = r"Dr.Mishra-materials"  # Folder containing source files
@@ -16,8 +19,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Dictionary to track used filenames and avoid overwriting
 used_names = defaultdict(int)
 
-# Function to extract text from a file based on its extension
 def extract_text(file_path):
+    """ Function to extract text from a file based on its extension """
     ext = os.path.splitext(file_path)[1].lower()  # Get file extension in lowercase
 
     try:
@@ -47,19 +50,18 @@ def extract_text(file_path):
         elif ext == '.pptx':
             prs = Presentation(file_path)
             return "\n".join(
-                shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")
+                shape.text for slide in prs.slides for shape in slide.shapes if hasattr(
+                    shape, "text"
+                )
             )
 
         # Read plain text directly from config, Python, or PsychoPy experiment files
         elif ext in ['.conf', '.py', '.psyexp', '.txt']:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
-            
+
         # Attempt to extract text from .jasp file (which is a ZIP archive)
         elif ext == '.jasp':
-            import zipfile
-            import tempfile
-            import json
 
             try:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
@@ -85,7 +87,8 @@ def extract_text(file_path):
                                 lines = []
                                 if isinstance(obj, dict):
                                     for key, val in obj.items():
-                                        lines.extend(walk_results(val, f"{path}/{key}" if path else key))
+                                        lines.extend(walk_results(
+                                            val, f"{path}/{key}" if path else key))
                                 elif isinstance(obj, list):
                                     for i, item in enumerate(obj):
                                         lines.extend(walk_results(item, f"{path}[{i}]"))
@@ -95,7 +98,8 @@ def extract_text(file_path):
                                 return lines
 
                             extracted = walk_results(results)
-                            output_parts.append("### Results Summary\n" + "\n".join(extracted[:100]))
+                            output_parts.append(
+                                "### Results Summary\n" + "\n".join(extracted[:100]))
 
                         # Optionally extract log.json (analysis steps)
                         log_path = os.path.join(tmpdir, 'log.json')
@@ -107,7 +111,7 @@ def extract_text(file_path):
 
                         return "\n\n".join(output_parts)
 
-            except Exception as e:
+            except (zipfile.BadZipFile, OSError, json.JSONDecodeError) as e:
                 print(f"[Error] Could not extract .jasp file {file_path}: {e}")
                 return ""
 
@@ -117,12 +121,14 @@ def extract_text(file_path):
             return ""
 
     # Catch and report any file-specific extraction errors
-    except Exception as e:
+    except (
+        OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError, json.JSONDecodeError
+    ) as e:
         print(f"[Error] Failed to extract {file_path}: {e}")
         return ""
 
-# Function to walk through all files in the input directory and process them
 def process_folder(input_dir, output_dir):
+    """ Function to walk through all files in the input directory and process them """
     for root, _, files in os.walk(input_dir):
         for file in files:
             file_path = os.path.join(root, file)
@@ -138,7 +144,8 @@ def process_folder(input_dir, output_dir):
                     used_names[base_name] += 1
                     final_name = f"{base_name}_{used_names[base_name]}"
 
-                out_path = os.path.join(output_dir, final_name + ext_name)  # Build final unique path
+                # Build final unique path
+                out_path = os.path.join(output_dir, final_name + ext_name)
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(text)
                 print(f"Saved: {out_path}")  # Confirm file was written

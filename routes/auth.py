@@ -1,12 +1,14 @@
-from fastapi import APIRouter, HTTPException, Depends, Response, Request, Cookie
-from pydantic import BaseModel, EmailStr
-from db import get_connection
-import bcrypt
-import secrets
-import hashlib
+""" This module handles all login and signup authentication for the application """
+import os
 from datetime import datetime, timedelta
 from typing import Optional
-import os
+import secrets
+import hashlib
+import bcrypt
+import asyncpg
+from fastapi import APIRouter, HTTPException, Depends, Response, Request
+from pydantic import BaseModel, EmailStr
+from db import get_connection
 
 router = APIRouter()
 
@@ -24,12 +26,14 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT == "production"
 
 class SignupRequest(BaseModel):
+    """ Defines the required data for a SignUpRequest """
     email: EmailStr
     password: str
     user_role: Optional[str] = "student"
     course_code: str  # Required for validation
 
 class LoginRequest(BaseModel):
+    """ Defines the required data for a LoginRequest """
     email: EmailStr
     password: str
     course_code: str  # Required for validation
@@ -54,19 +58,19 @@ async def store_session(user_id: str, token_hash: str):
             DO UPDATE SET token_hash = $2, expires_at = $3
         """, user_id, token_hash, expire_time)
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create session")
+        raise HTTPException(status_code=500, detail="Failed to create session") from e
     finally:
         await conn.close()
 
 async def get_current_user(request: Request):
     """Get current user from session token"""
     token = request.cookies.get("session_token")
-    
+
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     token_hash = hash_token(token)
-    
+
     conn = await get_connection()
     try:
         # Get user from session
@@ -76,15 +80,15 @@ async def get_current_user(request: Request):
             JOIN user_sessions s ON u.id = s.user_id
             WHERE s.token_hash = $1 AND s.expires_at > NOW()
         """, token_hash)
-        
+
         if not result:
             raise HTTPException(status_code=401, detail="Invalid or expired session")
-        
+
         return result
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to verify session")
+        raise HTTPException(status_code=500, detail="Failed to verify session") from e
     finally:
         await conn.close()
 
@@ -109,23 +113,26 @@ def set_secure_cookie(response: Response, session_token: str):
 
 @router.post("/signup")
 async def signup(data: SignupRequest, response: Response):
+    """ Handles making sure signup information is correct and adding new users to database """
     # Validate email domain
     if not validate_email_domain(data.email):
         raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
-    
+
     # Validate course code
     if not validate_course_code(data.course_code):
         raise HTTPException(status_code=400, detail="Invalid course code")
-    
+
     conn = await get_connection()
     try:
         # Check if user already exists
         existing_user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", data.email)
         if existing_user:
             raise HTTPException(status_code=400, detail="User already exists")
-        
+
         # Hash password
-        hashed_password = bcrypt.hashpw(data.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        hashed_password = bcrypt.hashpw(
+            data.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"
+        )
 
         # Insert user (course_code stored but not returned for privacy)
         result = await conn.fetchrow("""
@@ -138,7 +145,7 @@ async def signup(data: SignupRequest, response: Response):
         session_token = create_session_token()
         token_hash = hash_token(session_token)
         await store_session(str(result['id']), token_hash)
-        
+
         # Set secure cookie
         set_secure_cookie(response, session_token)
 
@@ -154,36 +161,39 @@ async def signup(data: SignupRequest, response: Response):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create user")
+        raise HTTPException(status_code=500, detail="Failed to create user") from e
     finally:
         await conn.close()
 
 @router.post("/login")
 async def login(data: LoginRequest, response: Response):
+    """ Handles making sure login information is correct """
     # Validate email domain
     if not validate_email_domain(data.email):
         raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
-    
+
     # Validate course code
     if not validate_course_code(data.course_code):
         raise HTTPException(status_code=400, detail="Invalid course code")
-    
+
     conn = await get_connection()
     try:
         # Get user by email
         user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", data.email)
         if not user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
+
         # Check password
-        if not bcrypt.checkpw(data.password.encode("utf-8"), user['hashed_password'].encode("utf-8")):
+        if not bcrypt.checkpw(
+            data.password.encode("utf-8"), user['hashed_password'].encode("utf-8")
+        ):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
+
         # Create session
         session_token = create_session_token()
         token_hash = hash_token(session_token)
         await store_session(str(user['id']), token_hash)
-        
+
         # Set secure cookie
         set_secure_cookie(response, session_token)
 
@@ -199,28 +209,30 @@ async def login(data: LoginRequest, response: Response):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Login failed")
+        raise HTTPException(status_code=500, detail="Login failed") from e
     finally:
         await conn.close()
 
 @router.post("/logout")
 async def logout(response: Response, current_user = Depends(get_current_user)):
+    """ Handles logging users out out of their current session """
     # Delete session from database
     conn = await get_connection()
     try:
         await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", current_user['id'])
-    except Exception as e:
+    except asyncpg.PostgresError as e:
         # Log error but don't fail logout
         print(f"Failed to delete session: {e}")
     finally:
         await conn.close()
-    
+
     # Clear cookie
     response.delete_cookie(key="session_token")
     return {"message": "Logged out successfully"}
 
 @router.get("/me")
 async def get_current_user_info(current_user = Depends(get_current_user)):
+    """ Returns neccessary user information needed """
     return {
         "id": str(current_user['id']),
         "email": current_user['email'],
