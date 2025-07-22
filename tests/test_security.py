@@ -1,5 +1,4 @@
 """ test_security.py - Security-focused tests """
-import os
 import asyncio
 import time
 import gc
@@ -207,14 +206,6 @@ class TestDatabaseSecurity:
             assert malicious_email in call_args[0]
 
     @pytest.mark.asyncio
-    async def test_connection_pool_limits(self):
-        """Test database connection pool respects limits"""
-
-        # This would require actual database testing
-        # In production, use test database
-        pass
-
-    @pytest.mark.asyncio
     async def test_password_hashing(self):
         """Test password hashing in database operations"""
         password = "TestPassword123!"
@@ -332,20 +323,3 @@ def event_loop():
     loop = asyncio.get_event_loop_policy().new_event_loop()
     yield loop
     loop.close()
-
-@pytest.fixture(autouse=True)
-def setup_test_environment():
-    """Setup test environment variables"""
-    os.environ.update({
-        "ENVIRONMENT": "testing",
-        "DATABASE_URL": "postgresql://test:test@localhost:5432/test_tutorbot",
-        "API_KEY": "test_api_key",
-        "PINECONE_API_KEY": "test_pinecone_key",
-        "PINECONE_ENVIRONMENT": "test",
-        "JWT_SECRET_KEY": "test_secret_key_for_testing_only",
-        "VALID_COURSE_CODE": "TEST123"
-    })
-
-    yield
-
-    # Cleanup if needed
