@@ -1,30 +1,30 @@
+# docker-compose.yml - University Server (No PostgreSQL service)
 
 services:
-  db:
-    image: postgres:16
-    container_name: local_postgres
-    restart: always
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: SeanAugust2006!
-      POSTGRES_DB: tutorbot
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
   backend:
     build: .
-    container_name: backend
-    restart: always
-    volumes:
-      - .:/app  # This mounts the current directory to /app inside the container
+    container_name: tutor_chatbot_backend
+    restart: unless-stopped
     ports:
       - "8080:8080"
-    depends_on:
-      - db
     environment:
-      - DATABASE_URL=postgresql://postgres:SeanAugust2006!@db:5432/tutorbot
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
-volumes:
-  pgdata:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DATABASE_URL=${DATABASE_URL}
+      - API_KEY=${API_KEY}
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - VALID_COURSE_CODE=${VALID_COURSE_CODE}
+      - FRONTEND_URL=${FRONTEND_URL}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS}
+    volumes:
+      - ./logs:/app/logs
+    network_mode: "host"  # Allows container to access host PostgreSQL
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# No PostgreSQL service - using university server's PostgreSQL
+# No volumes section needed

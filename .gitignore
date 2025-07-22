@@ -1,28 +1,109 @@
-# Ignore Python virtual environments
-venv/
-
-# Ignore output and data
-*.txt
-!runtime.txt
-!requirements.txt
-!requirements_full.txt
-*.csv
-*.log
-output/
-box_texts/
-
-# Ignore Python bytecode and cache
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Ignore VS Code settings
+# Environment variables - CRITICAL FOR SECURITY
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.dev
+*.env
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE and editors
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Ignore OS-specific files
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-#Ignore Secrets
-.env
+# Logs
+*.log
+logs/
+app.log
 
-Dr.Mishra-materials/
+# Database files (if any local ones)
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+.dockerignore
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ML Models (if storing locally)
+models/
+*.bin
+*.safetensors
+
+# Temporary files
+tmp/
+temp/
+chunks.jsonl
+
+# Production specific
+docker-compose.prod.yml
+nginx.prod.conf
+
+# Secrets and keys
+secrets.txt
+keys.txt
+*.key
+*.pem
+
+# Backup files
+*.bak
+*.backup
+
+Dr.Mishra-Materials
+chunk_index.faiss
+texts

@@ -1,30 +1,13 @@
-""" This handles all interactions with the database for the sanbox feature """
+# routes/sandbox.py - Complete fixed version
+""" This handles all interactions with the database for the sandbox feature """
 import uuid
 import json
-from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from db import get_connection
+from db import db_manager  # Use new db_manager
+from models import EnvironmentCreate, SessionCreate, SandboxMessage  # Import from models
 from routes.auth import get_current_user
 
 router = APIRouter()
-
-class EnvironmentCreate(BaseModel):
-    """ Defines the format for what goes into creating an Environment """
-    name: str
-    description: Optional[str] = None
-    system_prompt: str
-    model_config: Optional[Dict[str, Any]] = {"temperature": 0.7}
-
-class SessionCreate(BaseModel):
-    """ Defines the format for what goes into creating a Session """
-    environment_id: str
-    session_name: Optional[str] = None
-
-class SandboxMessage(BaseModel):
-    """ Defines the format for what goes into a chat message in the sanbox environments """
-    role: str
-    content: str
 
 # Environment Management Endpoints
 
@@ -34,9 +17,8 @@ async def get_environments(current_user = Depends(get_current_user)):
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
-        environments = await conn.fetch("""
+        environments = await db_manager.execute_query("""
             SELECT e.*, u.email as created_by_email
             FROM sandbox_environments e
             LEFT JOIN users u ON e.created_by = u.id
@@ -56,8 +38,9 @@ async def get_environments(current_user = Depends(get_current_user)):
             result.append(env_dict)
 
         return result
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch environments: {str(e)}") from e
 
 @router.post("/sandbox/environments")
 async def create_environment(
@@ -68,9 +51,8 @@ async def create_environment(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
-        result = await conn.fetchrow("""
+        result = await db_manager.execute_one("""
             INSERT INTO sandbox_environments 
             (name, description, system_prompt, model_config, created_by)
             VALUES ($1, $2, $3, $4, $5)
@@ -79,8 +61,9 @@ async def create_environment(
             json.dumps(env_data.model_config), current_user['id'])
 
         return dict(result)
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create environment: {str(e)}") from e
 
 @router.delete("/sandbox/environments/{environment_id}")
 async def delete_environment(
@@ -91,10 +74,9 @@ async def delete_environment(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
         # First check if environment exists at all
-        env_exists = await conn.fetchrow("""
+        env_exists = await db_manager.execute_one("""
             SELECT created_by, u.email as created_by_email 
             FROM sandbox_environments e
             LEFT JOIN users u ON e.created_by = u.id
@@ -113,13 +95,16 @@ async def delete_environment(
             )
 
         # Delete the environment (cascade will handle sessions and messages)
-        await conn.execute("""
+        await db_manager.execute_command("""
             DELETE FROM sandbox_environments WHERE id = $1
         """, environment_id)
 
         return {"message": "Environment deleted successfully"}
-    finally:
-        await conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete environment: {str(e)}") from e
 
 # Session Management Endpoints
 
@@ -132,10 +117,9 @@ async def get_sessions(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
         # Get sessions for this environment and user
-        sessions = await conn.fetch("""
+        sessions = await db_manager.execute_query("""
             SELECT s.*, 
             COALESCE(msg_count.count, 0) as message_count
             FROM sandbox_sessions s
@@ -152,7 +136,7 @@ async def get_sessions(
         # Get messages for each session
         session_ids = [str(s['id']) for s in sessions]
         if session_ids:
-            messages = await conn.fetch("""
+            messages = await db_manager.execute_query("""
                 SELECT chat_id, id, role, content, created_at
                 FROM chat_logs 
                 WHERE sandbox_session_id = ANY($1::uuid[]) AND mode = 'sandbox'
@@ -187,8 +171,8 @@ async def get_sessions(
         else:
             return []
 
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sessions: {str(e)}") from e
 
 @router.post("/sandbox/sessions")
 async def create_session(
@@ -199,10 +183,9 @@ async def create_session(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
         # Verify environment exists
-        env = await conn.fetchrow("""
+        env = await db_manager.execute_one("""
             SELECT * FROM sandbox_environments WHERE id = $1
         """, session_data.environment_id)
 
@@ -212,14 +195,14 @@ async def create_session(
         # Create session
         session_name = session_data.session_name or f"Session {uuid.uuid4().hex[:8]}"
 
-        result = await conn.fetchrow("""
+        result = await db_manager.execute_one("""
             INSERT INTO sandbox_sessions (environment_id, user_id, session_name)
             VALUES ($1, $2, $3)
             RETURNING *
         """, session_data.environment_id, current_user['id'], session_name)
 
         # Create initial system message
-        await conn.execute("""
+        await db_manager.execute_command("""
             INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
             VALUES ($1, $1, $2, 'system', 'New sandbox session started', 'sandbox')
         """, result['id'], current_user['id'])
@@ -229,8 +212,10 @@ async def create_session(
             "session_name": result['session_name'],
             "message": "Session created successfully"
         }
-    finally:
-        await conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}") from e
 
 @router.put("/sandbox/sessions/{session_id}")
 async def update_session(
@@ -242,17 +227,16 @@ async def update_session(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
-        await conn.execute("""
+        await db_manager.execute_command("""
             UPDATE sandbox_sessions 
             SET session_name = $1 
             WHERE id = $2 AND user_id = $3
         """, update_data.get('session_name'), session_id, current_user['id'])
 
         return {"message": "Session updated successfully"}
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update session: {str(e)}") from e
 
 @router.delete("/sandbox/sessions/{session_id}")
 async def delete_session(
@@ -263,17 +247,16 @@ async def delete_session(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
         # Delete session and related messages
-        await conn.execute("""
+        await db_manager.execute_command("""
             DELETE FROM sandbox_sessions 
             WHERE id = $1 AND user_id = $2
         """, session_id, current_user['id'])
 
         return {"message": "Session deleted successfully"}
-    finally:
-        await conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}") from e
 
 @router.post("/sandbox/sessions/{session_id}/messages")
 async def add_sandbox_message(
@@ -285,10 +268,9 @@ async def add_sandbox_message(
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    conn = await get_connection()
     try:
         # Verify session exists and belongs to user
-        session = await conn.fetchrow("""
+        session = await db_manager.execute_one("""
             SELECT * FROM sandbox_sessions 
             WHERE id = $1 AND user_id = $2
         """, session_id, current_user['id'])
@@ -297,7 +279,7 @@ async def add_sandbox_message(
             raise HTTPException(status_code=404, detail="Session not found")
 
         # Add message
-        result = await conn.fetchrow("""
+        result = await db_manager.execute_one("""
             INSERT INTO chat_logs 
             (chat_id, sandbox_session_id, user_id, role, content, mode)
             VALUES ($1, $1, $2, $3, $4, 'sandbox')
@@ -311,5 +293,96 @@ async def add_sandbox_message(
             "content": message.content,
             "created_at": result['created_at'].isoformat()
         }
-    finally:
-        await conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add message: {str(e)}") from e
+
+@router.get("/sandbox/environments/{environment_id}/details")
+async def get_environment_details(
+    environment_id: str,
+    current_user = Depends(get_current_user)
+):
+    """Get detailed information about a specific environment"""
+    if current_user['user_role'] != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Get environment details
+        env = await db_manager.execute_one("""
+            SELECT e.*, u.email as created_by_email
+            FROM sandbox_environments e
+            LEFT JOIN users u ON e.created_by = u.id
+            WHERE e.id = $1
+        """, environment_id)
+
+        if not env:
+            raise HTTPException(status_code=404, detail="Environment not found")
+
+        env_dict = dict(env)
+        if env_dict['model_config']:
+            env_dict['model_config'] = json.loads(env_dict['model_config'])
+
+        # Get session count for this environment
+        session_count = await db_manager.execute_one("""
+            SELECT COUNT(*) as count
+            FROM sandbox_sessions 
+            WHERE environment_id = $1
+        """, environment_id)
+
+        env_dict['session_count'] = session_count['count'] if session_count else 0
+        env_dict['can_delete'] = env_dict['created_by'] == current_user['id']
+
+        return env_dict
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch environment details: {str(e)}") from e
+
+@router.put("/sandbox/environments/{environment_id}")
+async def update_environment(
+    environment_id: str,
+    env_data: EnvironmentCreate,
+    current_user = Depends(get_current_user)
+):
+    """Update a sandbox environment (admin only, creator only)"""
+    if current_user['user_role'] != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Check if environment exists and user owns it
+        env_exists = await db_manager.execute_one("""
+            SELECT created_by FROM sandbox_environments WHERE id = $1
+        """, environment_id)
+
+        if not env_exists:
+            raise HTTPException(status_code=404, detail="Environment not found")
+
+        if env_exists['created_by'] != current_user['id']:
+            raise HTTPException(
+                status_code=403,
+                detail="Only the creator can modify this environment"
+            )
+
+        # Update environment
+        result = await db_manager.execute_one("""
+            UPDATE sandbox_environments 
+            SET name = $1, description = $2, system_prompt = $3, 
+                model_config = $4, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $5
+            RETURNING *
+        """, env_data.name, env_data.description, env_data.system_prompt,
+            json.dumps(env_data.model_config), environment_id)
+
+        if result and result['model_config']:
+            result_dict = dict(result)
+            result_dict['model_config'] = json.loads(result_dict['model_config'])
+            return result_dict
+
+        return dict(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update environment: {str(e)}") from e

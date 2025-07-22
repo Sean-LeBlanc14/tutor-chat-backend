@@ -1,19 +1,22 @@
 """ This module handles all login and signup authentication for the application """
 import os
 from datetime import datetime, timedelta
-from typing import Optional
 import secrets
 import hashlib
 import bcrypt
 import asyncpg
 from fastapi import APIRouter, HTTPException, Depends, Response, Request
-from pydantic import BaseModel, EmailStr
-from db import get_connection
+
+# Import from your new modules
+from db import db_manager  # Use the new db_manager instead of get_connection
+from models import SignupRequest, LoginRequest  # Use models from models.py
+from security import log_security_event
+from error_handler import rate_limit
 
 router = APIRouter()
 
 # Session configuration
-SESSION_EXPIRE_HOURS = 24
+SESSION_EXPIRE_HOURS = 8  # Reduced for security
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-fallback-secret-key")
 VALID_COURSE_CODE = os.getenv("VALID_COURSE_CODE")
 
@@ -25,33 +28,24 @@ if not VALID_COURSE_CODE:
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT == "production"
 
-class SignupRequest(BaseModel):
-    """ Defines the required data for a SignUpRequest """
-    email: EmailStr
-    password: str
-    user_role: Optional[str] = "student"
-    course_code: str  # Required for validation
-
-class LoginRequest(BaseModel):
-    """ Defines the required data for a LoginRequest """
-    email: EmailStr
-    password: str
-    course_code: str  # Required for validation
-
 def create_session_token():
     """Create a secure session token"""
-    return secrets.token_urlsafe(32)
+    return secrets.token_urlsafe(64)  # Increased length
 
 def hash_token(token: str) -> str:
     """Hash token for secure storage"""
-    return hashlib.sha256((token + SECRET_KEY).encode()).hexdigest()
+    return hashlib.pbkdf2_hmac(
+        'sha256',
+        token.encode('utf-8'),
+        SECRET_KEY.encode('utf-8'),
+        100000
+    ).hex()
 
 async def store_session(user_id: str, token_hash: str):
     """Store session in database with proper connection handling"""
-    conn = await get_connection()
     try:
         expire_time = datetime.utcnow() + timedelta(hours=SESSION_EXPIRE_HOURS)
-        await conn.execute("""
+        await db_manager.execute_command("""
             INSERT INTO user_sessions (user_id, token_hash, expires_at)
             VALUES ($1, $2, $3)
             ON CONFLICT (user_id) 
@@ -59,8 +53,6 @@ async def store_session(user_id: str, token_hash: str):
         """, user_id, token_hash, expire_time)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to create session") from e
-    finally:
-        await conn.close()
 
 async def get_current_user(request: Request):
     """Get current user from session token"""
@@ -71,10 +63,9 @@ async def get_current_user(request: Request):
 
     token_hash = hash_token(token)
 
-    conn = await get_connection()
     try:
         # Get user from session
-        result = await conn.fetchrow("""
+        result = await db_manager.execute_one("""
             SELECT u.id, u.email, u.user_role, s.expires_at
             FROM users u
             JOIN user_sessions s ON u.id = s.user_id
@@ -89,8 +80,6 @@ async def get_current_user(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to verify session") from e
-    finally:
-        await conn.close()
 
 def validate_course_code(provided_code: str) -> bool:
     """Validate course code against server-side value"""
@@ -112,30 +101,34 @@ def set_secure_cookie(response: Response, session_token: str):
     )
 
 @router.post("/signup")
+@rate_limit(lambda data, response: data.email)
 async def signup(data: SignupRequest, response: Response):
-    """ Handles making sure signup information is correct and adding new users to database """
-    # Validate email domain
-    if not validate_email_domain(data.email):
-        raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
-
-    # Validate course code
-    if not validate_course_code(data.course_code):
-        raise HTTPException(status_code=400, detail="Invalid course code")
-
-    conn = await get_connection()
+    """Handles making sure signup information is correct and adding new users to database"""
     try:
+        # Validate email domain
+        if not validate_email_domain(data.email):
+            log_security_event("INVALID_EMAIL_DOMAIN", data.email)
+            raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
+
+        # Validate course code
+        if not validate_course_code(data.course_code):
+            log_security_event("INVALID_COURSE_CODE", data.email)
+            raise HTTPException(status_code=400, detail="Invalid course code")
+
         # Check if user already exists
-        existing_user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", data.email)
+        existing_user = await db_manager.execute_one(
+            "SELECT * FROM users WHERE email = $1", data.email
+        )
         if existing_user:
             raise HTTPException(status_code=400, detail="User already exists")
 
         # Hash password
         hashed_password = bcrypt.hashpw(
-            data.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"
-        )
+            data.password.encode("utf-8"), bcrypt.gensalt()
+        ).decode("utf-8")
 
-        # Insert user (course_code stored but not returned for privacy)
-        result = await conn.fetchrow("""
+        # Insert user
+        result = await db_manager.execute_one("""
             INSERT INTO users (email, hashed_password, user_role, course_code)
             VALUES ($1, $2, $3, $4)
             RETURNING id, email, user_role
@@ -149,44 +142,50 @@ async def signup(data: SignupRequest, response: Response):
         # Set secure cookie
         set_secure_cookie(response, session_token)
 
+        log_security_event("USER_SIGNUP_SUCCESS", data.email)
+
         return {
             "message": "User created successfully",
             "user": {
                 "id": str(result['id']),
                 "email": result['email'],
                 "user_role": result['user_role']
-                # course_code intentionally omitted for privacy
             }
         }
     except HTTPException:
         raise
     except Exception as e:
+        log_security_event("USER_SIGNUP_ERROR", data.email, str(e))
         raise HTTPException(status_code=500, detail="Failed to create user") from e
-    finally:
-        await conn.close()
 
 @router.post("/login")
+@rate_limit(lambda data, response: data.email)
 async def login(data: LoginRequest, response: Response):
-    """ Handles making sure login information is correct """
-    # Validate email domain
-    if not validate_email_domain(data.email):
-        raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
-
-    # Validate course code
-    if not validate_course_code(data.course_code):
-        raise HTTPException(status_code=400, detail="Invalid course code")
-
-    conn = await get_connection()
+    """Handles making sure login information is correct"""
     try:
+        # Validate email domain
+        if not validate_email_domain(data.email):
+            log_security_event("INVALID_EMAIL_DOMAIN", data.email)
+            raise HTTPException(status_code=400, detail="Email must be a @csub.edu address")
+
+        # Validate course code
+        if not validate_course_code(data.course_code):
+            log_security_event("INVALID_COURSE_CODE", data.email)
+            raise HTTPException(status_code=400, detail="Invalid course code")
+
         # Get user by email
-        user = await conn.fetchrow("SELECT * FROM users WHERE email = $1", data.email)
+        user = await db_manager.execute_one(
+            "SELECT * FROM users WHERE email = $1", data.email
+        )
         if not user:
+            log_security_event("LOGIN_FAILED_USER_NOT_FOUND", data.email)
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         # Check password
         if not bcrypt.checkpw(
             data.password.encode("utf-8"), user['hashed_password'].encode("utf-8")
         ):
+            log_security_event("LOGIN_FAILED_WRONG_PASSWORD", data.email)
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         # Create session
@@ -197,34 +196,34 @@ async def login(data: LoginRequest, response: Response):
         # Set secure cookie
         set_secure_cookie(response, session_token)
 
+        log_security_event("LOGIN_SUCCESS", data.email)
+
         return {
             "message": "Login successful",
             "user": {
                 "id": str(user['id']),
                 "email": user['email'],
                 "user_role": user['user_role']
-                # course_code intentionally omitted for privacy
             }
         }
     except HTTPException:
         raise
     except Exception as e:
+        log_security_event("LOGIN_ERROR", data.email, str(e))
         raise HTTPException(status_code=500, detail="Login failed") from e
-    finally:
-        await conn.close()
 
 @router.post("/logout")
 async def logout(response: Response, current_user = Depends(get_current_user)):
-    """ Handles logging users out out of their current session """
-    # Delete session from database
-    conn = await get_connection()
+    """Handles logging users out of their current session"""
     try:
-        await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", current_user['id'])
+        await db_manager.execute_command(
+            "DELETE FROM user_sessions WHERE user_id = $1", 
+            current_user['id']
+        )
+        log_security_event("LOGOUT_SUCCESS", current_user['email'])
     except asyncpg.PostgresError as e:
         # Log error but don't fail logout
-        print(f"Failed to delete session: {e}")
-    finally:
-        await conn.close()
+        log_security_event("LOGOUT_ERROR", current_user['email'], str(e))
 
     # Clear cookie
     response.delete_cookie(key="session_token")
@@ -232,10 +231,9 @@ async def logout(response: Response, current_user = Depends(get_current_user)):
 
 @router.get("/me")
 async def get_current_user_info(current_user = Depends(get_current_user)):
-    """ Returns neccessary user information needed """
+    """Returns necessary user information needed"""
     return {
         "id": str(current_user['id']),
         "email": current_user['email'],
         "user_role": current_user['user_role']
-        # course_code intentionally omitted for privacy
     }
