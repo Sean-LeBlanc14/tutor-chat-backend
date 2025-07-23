@@ -1,5 +1,6 @@
-# docker-compose.yml - University Server (No PostgreSQL service)
+version: '3.7'
 
+# docker-compose.yml - University Server (No PostgreSQL service)
 services:
   backend:
     build: .
@@ -19,7 +20,7 @@ services:
       - ALLOWED_HOSTS=${ALLOWED_HOSTS}
     volumes:
       - ./logs:/app/logs
-    network_mode: "host"  # Allows container to access host PostgreSQL
+    network_mode: "host"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
       interval: 30s

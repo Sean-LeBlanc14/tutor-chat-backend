@@ -41,7 +41,7 @@ def hash_token(token: str) -> str:
         100000
     ).hex()
 
-async def store_session(user_id: str, token_hash: str):
+async def store_session(user_id: int, token_hash: str):
     """Store session in database with proper connection handling"""
     try:
         expire_time = datetime.utcnow() + timedelta(hours=SESSION_EXPIRE_HOURS)
@@ -134,10 +134,10 @@ async def signup(data: SignupRequest, response: Response):
             RETURNING id, email, user_role
         """, data.email, hashed_password, data.user_role, data.course_code)
 
-        # Create session
+        # Create session - FIXED: Remove str() conversion
         session_token = create_session_token()
         token_hash = hash_token(session_token)
-        await store_session(str(result['id']), token_hash)
+        await store_session(result['id'], token_hash)
 
         # Set secure cookie
         set_secure_cookie(response, session_token)
@@ -188,10 +188,10 @@ async def login(data: LoginRequest, response: Response):
             log_security_event("LOGIN_FAILED_WRONG_PASSWORD", data.email)
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        # Create session
+        # Create session - FIXED: Remove str() conversion
         session_token = create_session_token()
         token_hash = hash_token(session_token)
-        await store_session(str(user['id']), token_hash)
+        await store_session(user['id'], token_hash)
 
         # Set secure cookie
         set_secure_cookie(response, session_token)
@@ -237,3 +237,14 @@ async def get_current_user_info(current_user = Depends(get_current_user)):
         "email": current_user['email'],
         "user_role": current_user['user_role']
     }
+
+def set_secure_cookie(response: Response, session_token: str):
+	"""Set secure cookies with environment appropriate settings"""
+	response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,  # ✅ Must be True for cross-origin
+        samesite="none",  # ✅ Changed from "lax" to "none" 
+        max_age=SESSION_EXPIRE_HOURS * 3600
+    )

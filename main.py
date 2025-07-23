@@ -66,11 +66,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 if ENVIRONMENT == "production":
     # Production CORS - specific origins
     allowed_origins = [FRONTEND_URL]
-    
-    # Also allow the university domain for testing
-    if "athena.cs.csubak.edu" not in FRONTEND_URL:
-        allowed_origins.append("https://athena.cs.csubak.edu")
-    
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
