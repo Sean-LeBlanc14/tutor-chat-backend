@@ -8,6 +8,8 @@ from functools import lru_cache
 from pinecone import Pinecone
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.nn.functional as F
 
 load_dotenv()
 
@@ -131,24 +133,73 @@ def load_text_for_chunks(chunks, chunk_file_path):
         print(f"Error loading chunk texts: {e}")
         return []
 
-def call_mistral_api(prompt, temperature=0.7):
-    """Call the Mistral LLM and return the response"""
-    url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "mistral-small",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature
-    }
+@lru_cache(maxsize=1)
+def get_local_model():
+    """Load and cache the local Llama model"""
+    print("Loading Llama 3.1 8B model...")
+    model_name = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+
+    #Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    #:Load model with GPU acceleration
+    model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="cuda",
+            trust_remote_code=True
+    )
+
+    print("Model loaded successfully")
+    return tokenizer, model
+
+def call_local_llama(prompt, temperature=0.7, max_new_tokens=1024):
+    """Call the local Llama model and return the response"""
+    print("DEBUG: call_local_llama function called!")
+
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except requests.exceptions.RequestException as e:
-        return "I'm having trouble connecting right now. Please try again in a moment."
+        tokenizer, model = get_local_model()
+
+        #Format prompt for Llama chat template
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+        )
+
+        #Tokenize Input
+        inputs = tokenizer (
+                formatted_prompt,
+                return_tensors="pt"
+        ).to("cuda")
+
+        #Generate Response
+        with torch.no_grad():
+            outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+            )
+
+        #Decode Response
+        response = tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+        ).strip()
+
+        return response
+    
+    except Exception as e:
+        import traceback
+        print(f"Error with local model: {e}")
+        print(f"Full traceback: {traceback.format_exc()}")
+        return "I'm having trouble processing your request right now. Please try again."
+        
 
 def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
     """
@@ -197,7 +248,7 @@ Your Response:"""
             question=question
         )
 
-    answer = call_mistral_api(prompt, temperature)
+        answer = call_local_llama(prompt, temperature)
     return answer
 
 # Backward compatibility
