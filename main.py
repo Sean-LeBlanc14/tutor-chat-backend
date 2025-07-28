@@ -114,60 +114,6 @@ async def log_requests(request: Request, call_next):
 
     return response
 
-# Enhanced main.py chat endpoint
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(data: QuestionRequest):
-    """
-    Enhanced chat endpoint with chat memory support
-    """
-    try:
-        # Get chat history for context (if chat_id provided)
-        chat_history = []
-        if hasattr(data, 'chat_id') and data.chat_id:
-            try:
-                # Fetch recent messages from this chat
-                history_result = await db_manager.execute_query("""
-                    SELECT role, content 
-                    FROM chat_logs 
-                    WHERE chat_id = $1 AND mode = 'chat'
-                    ORDER BY created_at ASC
-                    LIMIT 20
-                """, data.chat_id)
-
-                chat_history = [
-                    {"role": msg["role"], "content": msg["content"]}
-                    for msg in history_result
-                    if msg["role"] in ['user', 'assistant']  # Updated: using 'assistant' instead of 'bot'
-                ]
-            except Exception as e:
-                logging.warning("Could not fetch chat history: %s", e)
-
-        result = ask_question(
-            question=data.question,
-            system_prompt=data.system_prompt,
-            temperature=data.temperature,
-            chat_history=chat_history  # Pass chat history
-        )
-
-        if not result or not result.strip():
-            raise CustomHTTPException(
-                status_code=500,
-                detail="Failed to generate response",
-                error_code="GENERATION_FAILED"
-            )
-
-        return ChatResponse(response=result)
-
-    except CustomHTTPException:
-        raise
-    except Exception as e:
-        logging.error("Chat endpoint error: %s", e)
-        raise CustomHTTPException(
-            status_code=500,
-            detail="Internal server error",
-            error_code="INTERNAL_ERROR"
-        ) from e
-
 @app.get("/api/health")
 async def health_check():
     """Enhanced health check with dependency verification"""
@@ -177,16 +123,15 @@ async def health_check():
             await conn.fetchrow("SELECT 1")
 
         # Test API key availability (don't expose the actual key)
-        api_key_available = bool(os.getenv("API_KEY"))
-        pinecone_available = bool(os.getenv("PINECONE_API_KEY"))
+        hf_token_available = bool(os.getenv("HF_TOKEN"))
 
         return {
             "status": "healthy",
             "environment": ENVIRONMENT,
             "database": "connected",
             "external_apis": {
-                "mistral": api_key_available,
-                "pinecone": pinecone_available
+                "huggingface": hf_token_available,
+                "vector_store": "faiss_local"
             }
         }
     except Exception as e:
@@ -221,6 +166,7 @@ if __name__ == "__main__":
             "main:app",
             host="0.0.0.0",
             port=port,
-            workers=4,  # Multiple workers for production
+            workers=1,
+            worker_class="uvicorn.workers.UvicornWorker",
             log_level="info"
         )

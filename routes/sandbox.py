@@ -6,6 +6,10 @@ from fastapi import APIRouter, HTTPException, Depends
 from db import db_manager  # Use new db_manager
 from models import EnvironmentCreate, SessionCreate, SandboxMessage  # Import from models
 from routes.auth import get_current_user
+import asyncio
+import logging
+from fastapi.responses import StreamingResponse
+from query_bot import ask_question_stream
 
 router = APIRouter()
 
@@ -386,3 +390,77 @@ async def update_environment(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to update environment: {str(e)}") from e
+        )
+
+@router.post("/sandbox/{session_id}/chat/stream")
+async def sandbox_chat_stream(
+    session_id: str,
+    message: SandboxMessage,
+    current_user = Depends(get_current_user)
+):
+    """Streaming chat endpoint for sandbox sessions"""
+    if current_user['user_role'] != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Get session and environment details
+        session_data = await db_manager.execute_one("""
+            SELECT s.*, e.system_prompt, e.model_config
+            FROM sandbox_sessions s
+            JOIN sandbox_environments e ON s.environment_id = e.id
+            WHERE s.id = $1 AND s.user_id = $2
+        """, session_id, current_user['id'])
+        
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get chat history for this session
+        chat_history = await db_manager.execute_query("""
+            SELECT role, content
+            FROM chat_logs
+            WHERE sandbox_session_id = $1 AND mode = 'sandbox'
+            ORDER BY created_at ASC
+            LIMIT 20
+        """, session_id)
+        
+        chat_history_list = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in chat_history
+            if msg["role"] in ['user', 'assistant']
+        ]
+        
+        async def generate_stream():
+            try:
+                loop = asyncio.get_event_loop()
+                
+                def token_generator():
+                    return ask_question_stream(
+                        message.content,
+                        session_data['system_prompt'],  # Use environment's system prompt
+                        0.7,  # Could get from model_config
+                        chat_history_list
+                    )
+                
+                generator = await loop.run_in_executor(None, token_generator)
+                
+                for token in generator:
+                    yield f"data: {token}\n\n"
+                    
+            except Exception as e:
+                logging.error("Sandbox streaming error: %s", e)
+                yield f"data: Error generating response\n\n"
+        
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("Sandbox stream endpoint error: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error") from e

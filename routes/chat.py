@@ -1,8 +1,14 @@
 
 # routes/chat.py - Fixed version
 """ This module handles all database interactions for the regular chat environment """
+import asyncio
+import logging
 from fastapi import APIRouter, HTTPException
-from db import db_manager  # Use new db_manager
+from fastapi.responses import StreamingResponse
+from models import QuestionRequest, ChatResponse
+from query_bot import ask_question_stream, ask_question
+from error_handler import CustomHTTPException
+from db import db_manager
 
 router = APIRouter()
 
@@ -118,3 +124,128 @@ async def delete_chat(chat_id: str, user_email: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}") from e
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(data: QuestionRequest):
+    """
+    Non-streaming chat endpoint for backward compatibility
+    """
+    try:
+        # Get chat history for context (if chat_id provided)
+        chat_history = []
+        if hasattr(data, 'chat_id') and data.chat_id:
+            try:
+                history_result = await db_manager.execute_query("""
+                    SELECT role, content
+                    FROM chat_logs
+                    WHERE chat_id = $1 AND mode = 'chat'
+                    ORDER BY created_at ASC
+                    LIMIT 20
+                """, data.chat_id)
+
+                chat_history = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in history_result
+                    if msg["role"] in ['user', 'assistant']
+                ]
+            except Exception as e:
+                logging.warning("Could not fetch chat history: %s", e)
+
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            ask_question,
+            data.question,
+            data.system_prompt,
+            data.temperature,
+            chat_history
+        )
+
+        if not result or not result.strip():
+            raise CustomHTTPException(
+                status_code=500,
+                detail="Failed to generate response",
+                error_code="GENERATION_FAILED"
+            )
+
+        return ChatResponse(response=result)
+
+    except CustomHTTPException:
+        raise
+    except Exception as e:
+        logging.error("Chat endpoint error: %s", e)
+        raise CustomHTTPException(
+            status_code=500,
+            detail="Internal server error",
+            error_code="INTERNAL_ERROR"
+        ) from e
+
+@router.post("/chat/stream")
+async def chat_stream_endpoint(data: QuestionRequest):
+    """
+    NEW: Streaming chat endpoint for real-time responses
+    """
+    try:
+        # Get chat history for context (if chat_id provided)
+        chat_history = []
+        if hasattr(data, 'chat_id') and data.chat_id:
+            try:
+                history_result = await db_manager.execute_query("""
+                    SELECT role, content
+                    FROM chat_logs
+                    WHERE chat_id = $1 AND mode = 'chat'
+                    ORDER BY created_at ASC
+                    LIMIT 20
+                """, data.chat_id)
+
+                chat_history = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in history_result
+                    if msg["role"] in ['user', 'assistant']
+                ]
+            except Exception as e:
+                logging.warning("Could not fetch chat history: %s", e)
+
+        async def generate_stream():
+            try:
+                # Stream the response
+                loop = asyncio.get_event_loop()
+                
+                # Create a generator function that yields tokens
+                def token_generator():
+                    return ask_question_stream(
+                        data.question,
+                        data.system_prompt,
+                        data.temperature,
+                        chat_history
+                    )
+                
+                # Run the generator in a thread pool
+                generator = await loop.run_in_executor(None, token_generator)
+                
+                for token in generator:
+                    # Format as Server-Sent Events
+                    yield f"data: {token}\n\n"
+                    
+            except Exception as e:
+                logging.error("Streaming error: %s", e)
+                yield f"data: Error generating response\n\n"
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+
+    except Exception as e:
+        logging.error("Stream endpoint error: %s", e)
+        raise CustomHTTPException(
+            status_code=500,
+            detail="Internal server error",
+            error_code="INTERNAL_ERROR"
+        ) from e

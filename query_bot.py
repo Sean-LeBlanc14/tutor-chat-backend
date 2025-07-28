@@ -4,18 +4,19 @@ import json
 import os
 import requests
 import torch
-from functools import lru_cache
-from pinecone import Pinecone
+import faiss
+import numpy as np
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
+from vllm import LLM, SamplingParams
+from vllm.utils import random_uuid
+from functools import lru_cache
 
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENV = os.getenv("PINECONE_ENVIRONMENT")
 INDEX_NAME = "tutor-bot-index"
 
 # Define file path for full chunk text
@@ -30,10 +31,65 @@ def get_embedding_model():
 # Usage:
 model = get_embedding_model()
 
-# Connect to Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)
+def load_faiss_index(index_path="chunk_index.faiss", metadata_path="chunk_metadata.json"):
+    """Load existing FAISS index and metadata"""
+    try:
+        # Load the FAISS index
+        index = faiss.read_index(index_path)
+        
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        print(f"Loaded FAISS index with {index.ntotal} vectors")
+        return index, metadata
+    except Exception as e:
+        print(f"Error loading FAISS index: {e}")
+        return None, []
 
+class FAISSVectorStore:
+    def __init__(self, embedding_dim=384):  # all-MiniLM-L6-v2 dimension
+        self.index = faiss.IndexFlatIP(embedding_dim)  # Inner product for cosine sim
+        self.metadata = []
+        
+    def add_vectors(self, vectors, metadata):
+        """Add vectors to the index"""
+        vectors = np.array(vectors).astype('float32')
+        # Normalize for cosine similarity
+        faiss.normalize_L2(vectors)
+        self.index.add(vectors)
+        self.metadata.extend(metadata)
+    
+    def search(self, query_vector, k=2):
+        """Search for similar vectors"""
+        query_vector = np.array([query_vector]).astype('float32')
+        faiss.normalize_L2(query_vector)
+        
+        scores, indices = self.index.search(query_vector, k)
+        
+        results = []
+        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+            if idx != -1:  # Valid result
+                results.append({
+                    'metadata': self.metadata[idx],
+                    'score': float(score)
+                })
+        return results
+
+# Initialize FAISS store
+try:
+    loaded_index, loaded_metadata = load_faiss_index()
+    if loaded_index is not None:
+        faiss_store = FAISSVectorStore()
+        faiss_store.index = loaded_index
+        faiss_store.metadata = loaded_metadata
+        print("Successfully loaded existing FAISS index")
+    else:
+        faiss_store = FAISSVectorStore()
+        print("Created new empty FAISS index")
+except:
+    faiss_store = FAISSVectorStore()
+    print("Created new empty FAISS index")
 # Unified system prompt that handles all question types
 UNIFIED_SYSTEM_PROMPT = """
 You are a helpful and friendly course assistant for psychology students. 
@@ -94,18 +150,15 @@ def format_chat_history(messages, max_history=8):
 
     return "\n\n".join(formatted_history) if formatted_history else "No previous conversation."
 
-def retrieve_relevant_chunks(query, k=5):
-    """Retrieves the top k most relevant chunks from DB"""
+
+def retrieve_relevant_chunks(query, k=2):
+    """Retrieves the top k most relevant chunks from FAISS"""
     try:
         query_embedding = model.encode([query])[0]
-        response = index.query(
-            vector=query_embedding.tolist(),
-            top_k=k,
-            include_metadata=True
-        )
-
-        chunks = [match['metadata'] for match in response['matches']]
-        scores = [match['score'] for match in response['matches']]
+        results = faiss_store.search(query_embedding, k)
+        
+        chunks = [result['metadata'] for result in results]
+        scores = [result['score'] for result in results]
         return chunks, scores
     except Exception as e:
         print(f"Error retrieving chunks: {e}")
@@ -132,88 +185,63 @@ def load_text_for_chunks(chunks, chunk_file_path):
     except Exception as e:
         print(f"Error loading chunk texts: {e}")
         return []
-
-@lru_cache(maxsize=1)
-def get_local_model():
-    """Load and cache the local Llama model"""
-    print("Loading Llama 3.1 8B model...")
-    model_name = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-
-    #Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    #:Load model with GPU acceleration
-    model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="cuda",
-            trust_remote_code=True
-    )
-
-    print("Model loaded successfully")
-    return tokenizer, model
-
-def call_local_llama(prompt, temperature=0.7, max_new_tokens=1024):
-    """Call the local Llama model and return the response"""
-    print("DEBUG: call_local_llama function called!")
-
-    try:
-        tokenizer, model = get_local_model()
-
-        #Format prompt for Llama chat template
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+        
+class OptimizedLlamaService:
+    def __init__(self):
+        print("Loading Llama 3.1 8B model with vLLM...")
+        self.llm = LLM(
+                model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+                gpu_memory_utilization=0.85,
+                max_model_len=4096,
+                tensor_parallel_size=1,
+                trust_remote_code=True,
+                tokenizer_mode="auto"
         )
 
-        #Tokenize Input
-        inputs = tokenizer (
-                formatted_prompt,
-                return_tensors="pt"
-        ).to("cuda")
+        self.sampling_params = SamplingParams(
+                temperature=0.7,
+                max_tokens=512,
+                stream=True
+        )
+        print("vLLM model loaded successfully")
 
-        #Generate Response
-        with torch.no_grad():
-            outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id
-            )
 
-        #Decode Response
-        response = tokenizer.decode(
-                outputs[0][inputs.input_ids.shape[1]:],
-                skip_special_tokens=True
-        ).strip()
+    def generate_stream(self, prompt, temperature=0.7):
+        """Stream response tokens"""
+        sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=512,
+                stream=True
+        )
 
-        return response
+        request_id = random_uuid()
+        results_generator = self.llm.generate(
+                [prompt],
+                sampling_params,
+                request_id=request_id
+        )
+
+        for request_output in results_generator:
+            for output in request_output.outputs:
+                yield output.text
+
     
-    except Exception as e:
-        import traceback
-        print(f"Error with local model: {e}")
-        print(f"Full traceback: {traceback.format_exc()}")
-        return "I'm having trouble processing your request right now. Please try again."
-        
+    def generate_batch(self, prompts, temperature=0.7):
+        """Handle multiple requests simultaneously"""
+        sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=512,
+                stream=False
+        )
 
-def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """
-    Unified Q&A function with intelligent question type handling.
-    
-    Args:
-        question (str): The user's question
-        system_prompt (str, optional): Custom system prompt (for sandbox)
-        temperature (float): Temperature for the AI model
-        chat_history (list, optional): Previous messages in the conversation
-    
-    Returns:
-        str: The AI's response
-    """
+        outputs = self.llm.generate(prompts, sampling_params)
+        return [output.outputs[0].text for output in outputs]
+
+llama_service = OptimizedLlamaService()
+
+
+def ask_question_stream(question, system_prompt=None, temperature=0.7, chat_history=None):
+    """Streaming version of ask_question"""
     # Default to empty history if none provided
     if chat_history is None:
         chat_history = []
@@ -248,10 +276,20 @@ Your Response:"""
             question=question
         )
 
-        answer = call_local_llama(prompt, temperature)
-    return answer
+    for token in llama_service.generate_stream(prompt, temperature):
+        yield token
 
 # Backward compatibility
-def ask_question_default(question):
+def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
     """Legacy function for backward compatibility"""
-    return ask_question(question)
+    response = ""
+    for token in ask_question_stream(question, system_prompt, temperature, chat_history):
+        response += token
+    return response
+
+
+
+
+
+
+
