@@ -105,5 +105,5 @@ keys.txt
 *.backup
 
 Dr.Mishra-Materials
-chunk_index.faiss
-textsstart-with-gpu.sh
+texts
+start-with-gpu.sh
