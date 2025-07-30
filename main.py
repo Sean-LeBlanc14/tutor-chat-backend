@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from models import QuestionRequest, ChatResponse
 from query_bot import ask_question
 from routes import chat, auth, sandbox
-from db import db_manager  # Import the global instance instead of creating new one
+from db import db_manager
 from error_handler import (
     validation_exception_handler,
     http_exception_handler,
@@ -29,12 +29,10 @@ validate_environment_variables()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """ Handles the start up and shutdown of the fastAPI app """
-    # Startup
     logging.info("Starting up application...")
     await db_manager.initialize()
     logging.info("Application startup complete")
     yield
-    # Shutdown
     logging.info("Shutting down application...")
     await db_manager.close()
     logging.info("Application shutdown complete")
@@ -52,7 +50,7 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
-# Security middleware
+# Trusted hosts for production
 if ENVIRONMENT == "production":
     app.add_middleware(
         TrustedHostMiddleware,
@@ -62,21 +60,19 @@ if ENVIRONMENT == "production":
 # Compression middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# CORS middleware - Updated for university server
+# CORS middleware
 if ENVIRONMENT == "production":
-    # Production CORS - specific origins
-    allowed_origins = [FRONTEND_URL]
-
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins=[FRONTEND_URL],
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
         expose_headers=["*"],
-        max_age=86400,  # Cache preflight for 24 hours
+        max_age=86400,
     )
 else:
+    # For dev, allow all
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -90,41 +86,34 @@ app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(Exception, general_exception_handler)
 
-# Include routers
+# Include API routes
 app.include_router(chat.router, prefix="/api", tags=["chat"])
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sandbox.router, prefix="/api", tags=["sandbox"])
 
-# Request logging middleware
+# Request logging
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """ Records requests made (http)"""
     start_time = time.time()
-
-    # Log request
     logging.info("Request: %s %s", request.method, request.url)
-
     response = await call_next(request)
-
-    # Log response
     process_time = time.time() - start_time
     logging.info(
-        "Response: %s | Time: %ss | Path: %s", response.status_code, process_time, request.url.path
+        "Response: %s | Time: %ss | Path: %s",
+        response.status_code,
+        process_time,
+        request.url.path,
     )
-
     return response
 
+# Health check
 @app.get("/api/health")
 async def health_check():
     """Enhanced health check with dependency verification"""
     try:
-        # Test database connection
         async with db_manager.get_connection() as conn:
             await conn.fetchrow("SELECT 1")
-
-        # Test API key availability (don't expose the actual key)
         hf_token_available = bool(os.getenv("HF_TOKEN"))
-
         return {
             "status": "healthy",
             "environment": ENVIRONMENT,
@@ -144,18 +133,15 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {"message": "Tutor Chatbot API", "version": "1.0.0"}
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8080))
 
-    # Different configurations for dev vs prod
     if ENVIRONMENT == "development":
         uvicorn.run(
-            "main:app", 
+            "main:app",
             host="0.0.0.0",
             port=port,
             reload=True,
@@ -170,3 +156,4 @@ if __name__ == "__main__":
             worker_class="uvicorn.workers.UvicornWorker",
             log_level="info"
         )
+

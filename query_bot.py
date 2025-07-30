@@ -11,7 +11,6 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
 from vllm import LLM, SamplingParams
-from vllm.utils import random_uuid
 from functools import lru_cache
 
 load_dotenv()
@@ -36,11 +35,11 @@ def load_faiss_index(index_path="chunk_index.faiss", metadata_path="chunk_metada
     try:
         # Load the FAISS index
         index = faiss.read_index(index_path)
-        
+
         # Load metadata
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
-        
+
         print(f"Loaded FAISS index with {index.ntotal} vectors")
         return index, metadata
     except Exception as e:
@@ -51,7 +50,7 @@ class FAISSVectorStore:
     def __init__(self, embedding_dim=384):  # all-MiniLM-L6-v2 dimension
         self.index = faiss.IndexFlatIP(embedding_dim)  # Inner product for cosine sim
         self.metadata = []
-        
+
     def add_vectors(self, vectors, metadata):
         """Add vectors to the index"""
         vectors = np.array(vectors).astype('float32')
@@ -59,14 +58,14 @@ class FAISSVectorStore:
         faiss.normalize_L2(vectors)
         self.index.add(vectors)
         self.metadata.extend(metadata)
-    
+
     def search(self, query_vector, k=2):
         """Search for similar vectors"""
         query_vector = np.array([query_vector]).astype('float32')
         faiss.normalize_L2(query_vector)
-        
+
         scores, indices = self.index.search(query_vector, k)
-        
+
         results = []
         for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
             if idx != -1:  # Valid result
@@ -90,48 +89,6 @@ try:
 except:
     faiss_store = FAISSVectorStore()
     print("Created new empty FAISS index")
-# Unified system prompt that handles all question types
-UNIFIED_SYSTEM_PROMPT = """
-You are a helpful and friendly course assistant for psychology students. 
-
-For each question the student asks, you must first identify it as one of three types:
-
-1. **Psychology Question**: New questions about psychology concepts, theories, research, or topics
-2. **Follow-up Question**: Questions that refer to your previous responses, asking for clarification, simplification, elaboration, examples, or step-by-step explanations
-3. **Irrelevant Question**: Questions not related to psychology or course content
-
-**Instructions for each type:**
-
-**Psychology Questions:**
-- Use the provided course context to give comprehensive, accurate answers
-- Draw from the course materials below to support your explanations
-- Provide clear examples and explanations appropriate for students
-- Reference relevant theories, researchers, or studies from the context
-
-**Follow-up Questions:**
-- Focus ONLY on your previous responses from the conversation history
-- Do NOT introduce new information from course context
-- If asked to simplify: make your previous explanation simpler
-- If asked to elaborate: add more detail to what you already said
-- If asked for examples: provide examples related to your previous response
-- If asked for steps: break down your previous explanation into clear steps
-
-**Irrelevant Questions:**
-- Politely redirect: "I'm here to help with psychology-related topics. Could you ask a psychology question instead?"
-- Do not attempt to answer non-psychology questions
-- Encourage the student to ask about psychology concepts
-
-**Available Information:**
-
-Previous Conversation:
-{chat_history}
-
-Course Context (use only for psychology questions):
-{context}
-
-Current Question: {question}
-
-**Your Response:**"""
 
 def format_chat_history(messages, max_history=8):
     """Format recent chat messages for context"""
@@ -156,7 +113,7 @@ def retrieve_relevant_chunks(query, k=2):
     try:
         query_embedding = model.encode([query])[0]
         results = faiss_store.search(query_embedding, k)
-        
+
         chunks = [result['metadata'] for result in results]
         scores = [result['score'] for result in results]
         return chunks, scores
@@ -185,57 +142,146 @@ def load_text_for_chunks(chunks, chunk_file_path):
     except Exception as e:
         print(f"Error loading chunk texts: {e}")
         return []
-        
+
 class OptimizedLlamaService:
     def __init__(self):
-        print("Loading Llama 3.1 8B model with vLLM...")
-        self.llm = LLM(
-                model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        print("Loading Llama 3.1 8B model...")
+
+        hf_token = os.getenv("HF_TOKEN")
+
+        try:
+            print("Attempting vLLM...")
+            self.llm = LLM(
+                model="meta-llama/Llama-3.1-8B-Instruct",
                 gpu_memory_utilization=0.85,
-                max_model_len=4096,
+                max_model_len=2048,
                 tensor_parallel_size=1,
                 trust_remote_code=True,
-                tokenizer_mode="auto"
-        )
+                tokenizer_mode="auto",
+            )
+            self.use_vllm = True
+            print("vLLM model loaded successfully!")
 
-        self.sampling_params = SamplingParams(
-                temperature=0.7,
-                max_tokens=512,
-                stream=True
-        )
-        print("vLLM model loaded successfully")
+        except Exception as e:
+            import traceback
+            print(f"vLLM failed with full error: {e}")
+            print(f"Full traceback: {traceback.format_exc()}")
+            print("Falling back to transformers (still optimized with streaming)...")
 
+            # Fallback to transformers
+            self.use_vllm = False
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                "meta-llama/Llama-3.1-8B-Instruct",
+                token=hf_token
+            )
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                "meta-llama/Llama-3.1-8B-Instruct",
+                torch_dtype=torch.float16,
+                device_map="cuda",
+                trust_remote_code=True,
+                token=hf_token
+            )
+            print("Transformers model loaded successfully!")
 
     def generate_stream(self, prompt, temperature=0.7):
         """Stream response tokens"""
-        sampling_params = SamplingParams(
+        if self.use_vllm:
+            sampling_params = SamplingParams(
                 temperature=temperature,
-                max_tokens=512,
-                stream=True
+                max_tokens=200,  # Even shorter to prevent loops
+                stop=["<|eot_id|>", "<|end_of_text|>", "**Correct Answer:**", "**Identity Question:**", "**Your Response:**"],
+                repetition_penalty=1.2,  # Prevent repetition
+            )
+
+            outputs = self.llm.generate([prompt], sampling_params)
+            full_response = outputs[0].outputs[0].text.strip()
+            
+            # Clean up the response - remove unwanted patterns
+            bad_patterns = [
+                "*** Your Answer:**",
+                "**Your Answer:**", 
+                "I have written",
+                "The question is:",
+                "You have to answer",
+                "1. The stimulus",
+                "2. The stimulus",
+                "If the stimulus",
+                "Next Steps:",
+                "--- ",
+                "Please fill in",
+                "What do you think",
+                "Instructions:",
+                "Wait for further"
+            ]
+            
+            # Find the first occurrence of any bad pattern and cut there
+            cut_index = len(full_response)
+            for pattern in bad_patterns:
+                index = full_response.find(pattern)
+                if index != -1 and index < cut_index:
+                    cut_index = index
+            
+            full_response = full_response[:cut_index].strip()
+
+            if not full_response:
+                yield "I apologize, but I'm having trouble generating a response right now."
+                return
+
+            # Simulate streaming by yielding words
+            words = full_response.split()
+            for word in words:
+                yield word + " "
+        else:
+            # Transformers fallback - simulate streaming
+            response = self._generate_transformers(prompt, temperature)
+            # Simulate streaming by yielding word by word
+            words = response.split()
+            for word in words:
+                yield word + " "
+
+    def _generate_transformers(self, prompt, temperature):
+        """Fallback transformers generation"""
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
         )
 
-        request_id = random_uuid()
-        results_generator = self.llm.generate(
-                [prompt],
-                sampling_params,
-                request_id=request_id
-        )
+        inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to("cuda")
 
-        for request_output in results_generator:
-            for output in request_output.outputs:
-                yield output.text
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
 
-    
+        response = self.tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=True
+        ).strip()
+
+        return response
+
     def generate_batch(self, prompts, temperature=0.7):
         """Handle multiple requests simultaneously"""
-        sampling_params = SamplingParams(
+        if self.use_vllm:
+            sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=512,
                 stream=False
-        )
-
-        outputs = self.llm.generate(prompts, sampling_params)
-        return [output.outputs[0].text for output in outputs]
+            )
+            outputs = self.llm.generate(prompts, sampling_params)
+            return [output.outputs[0].text for output in outputs]
+        else:
+            # Fallback for batch processing
+            return [self._generate_transformers(prompt, temperature) for prompt in prompts]
 
 llama_service = OptimizedLlamaService()
 
@@ -249,32 +295,38 @@ def ask_question_stream(question, system_prompt=None, temperature=0.7, chat_hist
     # Format chat history
     formatted_history = format_chat_history(chat_history)
 
-    # Get relevant chunks from RAG system for potential psychology questions
-    top_chunks, _ = retrieve_relevant_chunks(question)
+    # Get relevant chunks from RAG system
+    top_chunks, scores = retrieve_relevant_chunks(question, k=3)  # Back to 3 chunks
     context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
     combined_context = "\n\n".join(context_passages) if context_passages else "No relevant course material found."
 
     # Use custom prompt if provided (for sandbox), otherwise use unified prompt
     if system_prompt:
-        # For sandbox: use custom prompt but with same structure
-        prompt = f"""{system_prompt.strip()}
+        # For sandbox: use custom prompt but with better context handling
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-Previous Conversation:
-{formatted_history}
+{system_prompt.strip()}
 
-Course Context (if relevant):
-{combined_context}
+IMPORTANT: Only use the course materials below if they are directly relevant to the user's question. If the course materials are not relevant to what the user asked, ignore them completely and just respond naturally to the user's question.
 
-Current Question: {question}
+Course Materials (may not be relevant):
+{combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-Your Response:"""
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
     else:
-        # Use unified system prompt
-        prompt = UNIFIED_SYSTEM_PROMPT.format(
-            chat_history=formatted_history,
-            context=combined_context,
-            question=question
-        )
+        # Chat-style format that Llama is trained for
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful psychology course assistant. Answer student questions clearly and concisely. Use only the most relevant information from the course materials to answer their specific question. Do not reproduce answer keys or test questions.
+
+Course Materials:
+{combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
 
     for token in llama_service.generate_stream(prompt, temperature):
         yield token
@@ -286,10 +338,3 @@ def ask_question(question, system_prompt=None, temperature=0.7, chat_history=Non
     for token in ask_question_stream(question, system_prompt, temperature, chat_history):
         response += token
     return response
-
-
-
-
-
-
-

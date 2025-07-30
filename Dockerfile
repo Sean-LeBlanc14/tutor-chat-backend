@@ -1,24 +1,18 @@
 # Production Dockerfile - Updated for vLLM + GPU optimization
-FROM nvidia/cuda:12.2-devel-ubuntu22.04 as builder
+FROM python:3.11-slim AS builder
 
 # Set build arguments
 ARG ENVIRONMENT=production
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3.11-dev \
-    python3-pip \
     build-essential \
     libgl1-mesa-glx \
     libglib2.0-0 \
     poppler-utils \
     git \
+    wget \
     && rm -rf /var/lib/apt/lists/*
-
-# Create symlinks for python
-RUN ln -s /usr/bin/python3.11 /usr/bin/python && \
-    ln -s /usr/bin/python3.11 /usr/bin/python3
 
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
@@ -32,34 +26,27 @@ COPY requirements.txt .
 # Install Python dependencies (including vLLM)
 RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Pre-download models to cache them
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# Pre-download models to cache them - REMOVED to fix permissions
+# RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Production stage
-FROM nvidia/cuda:12.2-runtime-ubuntu22.04
+FROM python:3.11-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3-pip \
     libgl1-mesa-glx \
     libglib2.0-0 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Create symlinks for python
-RUN ln -s /usr/bin/python3.11 /usr/bin/python && \
-    ln -s /usr/bin/python3.11 /usr/bin/python3
-
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 # Create cache directories with proper permissions
-RUN mkdir -p /home/appuser/.cache /tmp/huggingface_cache /app/logs /app/data && \
+RUN mkdir -p /home/appuser/.cache /home/appuser/.cache/huggingface /app/logs /app/data && \
     chown -R appuser:appuser /home/appuser/.cache /app && \
-    chmod -R 755 /home/appuser/.cache && \
-    chmod -R 777 /tmp/huggingface_cache
+    chmod -R 755 /home/appuser/.cache
 
 # Set working directory
 WORKDIR /app
@@ -81,7 +68,6 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 ENV PYTHONPATH=/app
 ENV ENVIRONMENT=production
 ENV PORT=8080
-ENV HF_HOME=/tmp/huggingface_cache
 ENV CUDA_VISIBLE_DEVICES=0
 ENV VLLM_USE_MODELSCOPE=False
 

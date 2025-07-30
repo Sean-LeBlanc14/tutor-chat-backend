@@ -185,10 +185,12 @@ async def chat_endpoint(data: QuestionRequest):
 @router.post("/chat/stream")
 async def chat_stream_endpoint(data: QuestionRequest):
     """
-    NEW: Streaming chat endpoint for real-time responses
+    Streaming chat endpoint for real-time responses, with manual CORS headers.
     """
+    import os
+    from starlette.responses import StreamingResponse
+
     try:
-        # Get chat history for context (if chat_id provided)
         chat_history = []
         if hasattr(data, 'chat_id') and data.chat_id:
             try:
@@ -210,10 +212,8 @@ async def chat_stream_endpoint(data: QuestionRequest):
 
         async def generate_stream():
             try:
-                # Stream the response
                 loop = asyncio.get_event_loop()
-                
-                # Create a generator function that yields tokens
+
                 def token_generator():
                     return ask_question_stream(
                         data.question,
@@ -221,26 +221,29 @@ async def chat_stream_endpoint(data: QuestionRequest):
                         data.temperature,
                         chat_history
                     )
-                
-                # Run the generator in a thread pool
-                generator = await loop.run_in_executor(None, token_generator)
-                
-                for token in generator:
-                    # Format as Server-Sent Events
-                    yield f"data: {token}\n\n"
-                    
-            except Exception as e:
-                logging.error("Streaming error: %s", e)
-                yield f"data: Error generating response\n\n"
 
-        return StreamingResponse(
+                generator = await loop.run_in_executor(None, token_generator)
+
+                for token in generator:
+                    yield f"data: {token}\n\n"
+
+            except Exception as e:
+                import traceback
+                logging.error("Streaming error details: %s", str(e))
+                logging.error("Full traceback:\n%s", traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
+
+        # ✅ Manually add CORS headers for SSE
+        response = StreamingResponse(
             generate_stream(),
-            media_type="text/plain",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            }
+            media_type="text/event-stream"
         )
+        response.headers["Access-Control-Allow-Origin"] = os.getenv("FRONTEND_URL", "*")
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "keep-alive"
+
+        return response
 
     except Exception as e:
         logging.error("Stream endpoint error: %s", e)
@@ -249,3 +252,4 @@ async def chat_stream_endpoint(data: QuestionRequest):
             detail="Internal server error",
             error_code="INTERNAL_ERROR"
         ) from e
+

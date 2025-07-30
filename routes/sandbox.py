@@ -390,7 +390,6 @@ async def update_environment(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to update environment: {str(e)}") from e
-        )
 
 @router.post("/sandbox/{session_id}/chat/stream")
 async def sandbox_chat_stream(
