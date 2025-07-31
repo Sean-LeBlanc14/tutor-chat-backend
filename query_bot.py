@@ -24,12 +24,19 @@ API_KEY = os.getenv("API_KEY")
 INDEX_NAME = "tutor-bot-index"
 CHUNK_FILE = "chunks.jsonl"
 
+# Configuration constants - DEFINE THESE FIRST
+MAX_CONCURRENT_REQUESTS = 10  # Adjust based on your hardware
+EMERGENCY_MODE = False  # Set to True under high load
+
 # Response cache for common questions (saves 30-40% compute)
 response_cache = {}
 CACHE_TTL = 3600  # 1 hour
 
-# Request semaphore for controlled concurrency
-MAX_CONCURRENT_REQUESTS = 15  # Optimized for your GPU
+# Overflow handling for classroom scale
+CPU_FALLBACK_ENABLED = True
+current_gpu_requests = 0
+
+# Request semaphore for controlled concurrency - SINGLE DEFINITION
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 # Load sentence-transformer embedding model (optimized)
@@ -150,12 +157,8 @@ def classify_question_type(question: str) -> str:
 
     return "general"
 
-def should_use_rag(question: str, question_type: str, has_custom_prompt: bool = False) -> bool:
-    """Intelligent decision on whether to use RAG - only for psychology content in regular chat"""
-    # Never use RAG if there's a custom system prompt (sandbox mode)
-    if has_custom_prompt:
-        return False
-        
+def should_use_rag(question: str, question_type: str) -> bool:
+    """Intelligent decision on whether to use RAG"""
     # Never use RAG for casual conversation
     if question_type == "casual":
         return False
@@ -164,13 +167,13 @@ def should_use_rag(question: str, question_type: str, has_custom_prompt: bool = 
     if question_type == "test_question":
         return False
 
-    # Always use RAG for academic questions (but only in regular chat)
+    # Always use RAG for academic questions
     if question_type == "academic":
         return True
 
     # For general questions, use semantic similarity
     if question_type == "general":
-        # Quick semantic check for psychology content
+        # Quick semantic check
         academic_keywords = [
             'perception', 'sensation', 'visual', 'auditory', 'attention',
             'memory', 'learning', 'brain', 'neural', 'cognitive', 'psychology'
@@ -243,7 +246,7 @@ def load_text_for_chunks(chunks, chunk_file_path):
 
 class OptimizedLlamaService:
     def __init__(self):
-        print("Loading OPT-2.7B model for classroom scale...")
+        print("Loading optimized model for classroom scale...")
         hf_token = os.getenv("HF_TOKEN")
 
         try:
@@ -280,15 +283,36 @@ class OptimizedLlamaService:
                 trust_remote_code=True,
                 token=hf_token
             )
-            print("Transformers 3B model loaded successfully!")
+            print("Transformers 2.7B model loaded successfully!")
 
-    def generate_stream(self, prompt, temperature=0.7):
-        """Optimized streaming with better parameters"""
+    def generate_stream(self, prompt, temperature=0.7, question_type="general"):
+        """Emergency fast streaming optimized for classroom scale"""
         if self.use_vllm:
+            # EMERGENCY MODE: Much shorter responses for scale
+            if EMERGENCY_MODE:
+                if question_type == "academic":
+                    max_tokens = 200  # Concise but complete
+                elif question_type == "casual":
+                    max_tokens = 30   # Very short greetings
+                else:
+                    max_tokens = 150  # Conservative default
+            else:
+                # Normal mode (when not under load)
+                if question_type == "academic":
+                    max_tokens = 800
+                elif question_type == "casual":
+                    max_tokens = 100
+                else:
+                    max_tokens = 600
+
             sampling_params = SamplingParams(
                 temperature=temperature,
-                max_tokens=150,  # Shorter responses for speed
-                stop=["<|eot_id|>", "<|end_of_text|>"],
+                max_tokens=max_tokens,
+                stop=[
+                    "<|eot_id|>", "<|end_of_text|>", "\n\n",
+                    "Would you like me to", "Feel free to ask",
+                    "Is there anything specific", "Any questions about"
+                ],  # Stop when offering follow-ups
                 repetition_penalty=1.1,
             )
 
@@ -321,7 +345,7 @@ class OptimizedLlamaService:
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=200,
+                max_new_tokens=512,  # Increased for educational content
                 temperature=temperature,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
@@ -357,134 +381,87 @@ def is_cacheable_question(question: str, question_type: str) -> bool:
     return False
 
 def ask_question_stream(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """Smart streaming with concurrency control and caching (SYNC generator)"""
-    import asyncio
-    import time
+    """Smart streaming with concurrency control and caching - SYNC ONLY"""
+    
+    # Check cache for common questions
+    cache_key = get_cache_key(question, system_prompt)
+    if cache_key in response_cache:
+        cache_entry = response_cache[cache_key]
+        if time.time() - cache_entry['timestamp'] < CACHE_TTL:
+            # Return cached response as generator
+            words = cache_entry['response'].split()
+            for word in words:
+                yield word + " "
+            return
 
-    # Get the event loop
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # Classify question type
+    question_type = classify_question_type(question)
 
-    # Run the async function and return generator
-    return loop.run_until_complete(
-        _ask_question_stream_async(question, system_prompt, temperature, chat_history)
-    )
+    # Default to empty history if none provided
+    if chat_history is None:
+        chat_history = []
 
-async def _ask_question_stream_async(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """Internal async implementation"""
-    # Acquire semaphore for controlled concurrency
-    async with request_semaphore:
-        # Check cache for common questions
-        cache_key = get_cache_key(question, system_prompt)
-        if cache_key in response_cache:
-            cache_entry = response_cache[cache_key]
-            if time.time() - cache_entry['timestamp'] < CACHE_TTL:
-                # Return cached response as generator
-                def cached_generator():
-                    words = cache_entry['response'].split()
-                    for word in words:
-                        yield word + " "
-                return cached_generator()
+    # Handle different question types
+    if question_type == "casual":
+        # Simple response without RAG
+        simple_responses = {
+            "hi": "Hello! I'm here to help you with psychology concepts. What would you like to learn about?",
+            "hello": "Hi there! I'm your psychology tutor assistant. How can I help you today?",
+            "thanks": "You're welcome! Feel free to ask any psychology-related questions.",
+            "bye": "Goodbye! Good luck with your psychology studies!"
+        }
 
-        # Classify question type
-        question_type = classify_question_type(question)
+        for greeting, response in simple_responses.items():
+            if greeting in question.lower():
+                words = response.split()
+                for word in words:
+                    yield word + " "
+                return
 
-        # Default to empty history if none provided
-        if chat_history is None:
-            chat_history = []
+    elif question_type == "test_question":
+        # Provide guidance instead of answers
+        response = "I can help you understand concepts and provide explanations, but I can't give direct answers to test questions. Instead, let me help you understand the underlying concepts. What specific topic would you like me to explain?"
+        words = response.split()
+        for word in words:
+            yield word + " "
+        return
 
-        # Check if we have a custom system prompt (sandbox mode)
-        has_custom_prompt = system_prompt and system_prompt.strip()
+    # For academic questions, use smart RAG
+    if should_use_rag(question, question_type):
+        top_chunks, scores = get_adaptive_chunks(question, question_type)
+        context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
 
-        # Handle different question types
-        if question_type == "casual":
-            if has_custom_prompt:
-                # Custom system prompt (sandbox) - let it handle casual responses
-                pass  # Continue to normal prompt generation
-            else:
-                # Regular chat - use default psychology tutor responses
-                simple_responses = {
-                    "hi": "Hello! I'm here to help you with psychology concepts. What would you like to learn about?",
-                    "hello": "Hi there! I'm your psychology tutor assistant. How can I help you today?",
-                    "thanks": "You're welcome! Feel free to ask any psychology-related questions.",
-                    "bye": "Goodbye! Good luck with your psychology studies!"
-                }
+        # Filter low-relevance chunks
+        if scores and len(scores) > 0:
+            relevant_passages = []
+            for i, score in enumerate(scores):
+                if score > 0.3:  # Only use relevant chunks
+                    if i < len(context_passages):
+                        relevant_passages.append(context_passages[i])
 
-                for greeting, response in simple_responses.items():
-                    if greeting in question.lower():
-                        def simple_generator():
-                            words = response.split()
-                            for word in words:
-                                yield word + " "
-                        return simple_generator()
-
-        elif question_type == "test_question":
-            if has_custom_prompt:
-                # Custom system prompt (sandbox) - let it handle test questions
-                pass  # Continue to normal prompt generation
-            else:
-                # Regular chat - provide default psychology tutor guidance
-                response = "I can help you understand concepts and provide explanations, but I can't give direct answers to test questions. Instead, let me help you understand the underlying concepts. What specific topic would you like me to explain?"
-                def guidance_generator():
-                    words = response.split()
-                    for word in words:
-                        yield word + " "
-                return guidance_generator()
-
-        # For academic questions, use smart RAG (but respect custom prompts)
-        if should_use_rag(question, question_type, has_custom_prompt):
-            # Only use psychology-focused RAG for regular chat
-            top_chunks, scores = get_adaptive_chunks(question, question_type)
-            context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
-
-            # Filter low-relevance chunks
-            if scores and len(scores) > 0:
-                relevant_passages = []
-                for i, score in enumerate(scores):
-                    if score > 0.3:  # Only use relevant chunks
-                        if i < len(context_passages):
-                            relevant_passages.append(context_passages[i])
-
-                combined_context = "\n\n".join(relevant_passages) if relevant_passages else ""
-            else:
-                combined_context = ""
+            combined_context = "\n\n".join(relevant_passages) if relevant_passages else ""
         else:
-            # Custom prompt or non-academic - no RAG context
             combined_context = ""
+    else:
+        combined_context = ""
 
-        # Build prompt based on context availability and system prompt
-        if has_custom_prompt:
-            # Custom system prompt (sandbox) - use it directly
-            if combined_context:
-                # Include context if available (rare for sandbox)
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    # Build prompt based on context availability
+    if combined_context:
+        if system_prompt:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_prompt.strip()}
 
-Additional context:
+Relevant course materials:
 {combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-            else:
-                # Pure custom system prompt
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-{system_prompt.strip()}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-"""
         else:
-            # Regular chat - use default psychology tutor behavior
-            if combined_context:
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are a helpful psychology tutor. Answer the student's question using the provided course materials when relevant. Keep your response clear, educational, and engaging.
+You are a helpful psychology tutor. Provide clear, concise explanations that cover the key points. Give complete but summarized answers - students can always ask follow-up questions for more detail.
 
 Course Materials:
 {combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
@@ -492,31 +469,37 @@ Course Materials:
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-            else:
-                # No context needed - default psychology tutor
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    else:
+        # No context needed - direct conversation
+        if system_prompt:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are a helpful psychology tutor assistant. Answer the student's question clearly and educationally.<|eot_id|><|start_header_id|>user<|end_header_id|>
+{system_prompt.strip()}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+        else:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful psychology tutor assistant. Provide clear, concise explanations that cover the essential points. Keep responses complete but summarized - students can ask follow-up questions for deeper details.<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
 
-        # Generate response using the sync generator
-        def model_generator():
-            response_text = ""
-            for token in llama_service.generate_stream(prompt, temperature):
-                response_text += token
-                yield token
+    # Generate response using the sync generator
+    response_text = ""
+    for token in llama_service.generate_stream(prompt, temperature, question_type):
+        response_text += token
+        yield token
 
-            # Cache common academic questions (only for regular chat)
-            if not has_custom_prompt and is_cacheable_question(question, question_type):
-                response_cache[cache_key] = {
-                    'response': response_text.strip(),
-                    'timestamp': time.time()
-                }
-
-        return model_generator()
+    # Cache common academic questions
+    if is_cacheable_question(question, question_type):
+        response_cache[cache_key] = {
+            'response': response_text.strip(),
+            'timestamp': time.time()
+        }
 
 # Backward compatibility
 def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
@@ -536,6 +519,31 @@ def cleanup_cache():
     ]
     for key in expired_keys:
         del response_cache[key]
+
+# Async version for future use (if needed)
+async def ask_question_stream_async(question, system_prompt=None, temperature=0.7, chat_history=None):
+    """Async version with proper semaphore handling"""
+    async with request_semaphore:
+        # Use a thread pool to run the sync version
+        import concurrent.futures
+        import asyncio
+        
+        loop = asyncio.get_event_loop()
+        
+        # Create a list to collect all tokens
+        tokens = []
+        
+        def collect_tokens():
+            for token in ask_question_stream(question, system_prompt, temperature, chat_history):
+                tokens.append(token)
+        
+        # Run in thread pool to avoid blocking
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            await loop.run_in_executor(executor, collect_tokens)
+        
+        # Yield all collected tokens
+        for token in tokens:
+            yield token
 
 # Batch processing for high load (future enhancement)
 class BatchProcessor:
