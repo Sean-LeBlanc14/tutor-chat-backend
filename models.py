@@ -90,7 +90,7 @@ class EnvironmentCreate(BaseModel):
 
 class SessionCreate(BaseModel):
     """ Defines the data for a session within an environment """
-    environment_id: str = Field(..., pattern=r'^[0-9a-f-]{36}$')  # UUID format
+    environment_id: int = Field(..., gt=0)
     session_name: Optional[str] = Field(None, max_length=100)
 
     @field_validator('session_name')

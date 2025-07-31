@@ -57,12 +57,12 @@ async def create_environment(
 
     try:
         result = await db_manager.execute_one("""
-            INSERT INTO sandbox_environments 
+            INSERT INTO sandbox_environments
             (name, description, system_prompt, model_config, created_by)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING *
         """, env_data.name, env_data.description, env_data.system_prompt,
-            json.dumps(env_data.model_config), current_user['id'])
+            json.dumps(env_data.ai_config), current_user['id'])
 
         return dict(result)
     except Exception as e:
@@ -81,11 +81,11 @@ async def delete_environment(
     try:
         # First check if environment exists at all
         env_exists = await db_manager.execute_one("""
-            SELECT created_by, u.email as created_by_email 
+            SELECT created_by, u.email as created_by_email
             FROM sandbox_environments e
             LEFT JOIN users u ON e.created_by = u.id
             WHERE e.id = $1
-        """, environment_id)
+        """, int(environment_id))
 
         if not env_exists:
             raise HTTPException(status_code=404, detail="Environment not found")
@@ -122,50 +122,56 @@ async def get_sessions(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
+        # Convert environment_id to int
+        env_id = int(environment_id)
+        
         # Get sessions for this environment and user
         sessions = await db_manager.execute_query("""
-            SELECT s.*, 
+            SELECT s.*,
             COALESCE(msg_count.count, 0) as message_count
             FROM sandbox_sessions s
             LEFT JOIN (
                 SELECT sandbox_session_id, COUNT(*) as count
-                FROM chat_logs 
-                WHERE mode = 'sandbox'
+                FROM chat_logs
+                WHERE mode = 'sandbox' AND role != 'system'
                 GROUP BY sandbox_session_id
             ) msg_count ON s.id = msg_count.sandbox_session_id
             WHERE s.environment_id = $1 AND s.user_id = $2
             ORDER BY s.created_at DESC
-        """, environment_id, current_user['id'])
+        """, env_id, current_user['id'])
 
         # Get messages for each session
-        session_ids = [str(s['id']) for s in sessions]
+        session_ids = [s['id'] for s in sessions]
         if session_ids:
             messages = await db_manager.execute_query("""
-                SELECT chat_id, id, role, content, created_at
-                FROM chat_logs 
-                WHERE sandbox_session_id = ANY($1::uuid[]) AND mode = 'sandbox'
+                SELECT sandbox_session_id, id, role, content, created_at
+                FROM chat_logs
+                WHERE sandbox_session_id = ANY($1::integer[]) AND mode = 'sandbox'
                 ORDER BY created_at ASC
             """, session_ids)
 
             # Group messages by session
             grouped_messages = {}
             for msg in messages:
-                session_id = str(msg['chat_id'])
+                session_id = msg['sandbox_session_id']
                 if session_id not in grouped_messages:
                     grouped_messages[session_id] = []
-                grouped_messages[session_id].append({
-                    'id': str(msg['id']),
-                    'role': msg['role'],
-                    'content': msg['content'],
-                    'created_at': msg['created_at'].isoformat()
-                })
+                
+                # Skip system messages from display
+                if msg['role'] != 'system':
+                    grouped_messages[session_id].append({
+                        'id': str(msg['id']),
+                        'role': msg['role'],
+                        'content': msg['content'],
+                        'created_at': msg['created_at'].isoformat()
+                    })
 
             # Format response
             result = []
             for session in sessions:
-                session_id = str(session['id'])
+                session_id = session['id']
                 result.append({
-                    'id': session_id,
+                    'id': str(session_id),
                     'title': session['session_name'] or 'Untitled Session',
                     'messages': grouped_messages.get(session_id, []),
                     'created_at': session['created_at'].isoformat()
@@ -205,12 +211,6 @@ async def create_session(
             RETURNING *
         """, session_data.environment_id, current_user['id'], session_name)
 
-        # Create initial system message
-        await db_manager.execute_command("""
-            INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
-            VALUES ($1, $1, $2, 'system', 'New sandbox session started', 'sandbox')
-        """, result['id'], current_user['id'])
-
         return {
             "session_id": str(result['id']),
             "session_name": result['session_name'],
@@ -223,7 +223,7 @@ async def create_session(
 
 @router.put("/sandbox/sessions/{session_id}")
 async def update_session(
-    session_id: str,
+    session_id: int,
     update_data: dict,
     current_user = Depends(get_current_user)
 ):
@@ -233,8 +233,8 @@ async def update_session(
 
     try:
         await db_manager.execute_command("""
-            UPDATE sandbox_sessions 
-            SET session_name = $1 
+            UPDATE sandbox_sessions
+            SET session_name = $1
             WHERE id = $2 AND user_id = $3
         """, update_data.get('session_name'), session_id, current_user['id'])
 
@@ -244,7 +244,7 @@ async def update_session(
 
 @router.delete("/sandbox/sessions/{session_id}")
 async def delete_session(
-    session_id: str,
+    session_id: int,
     current_user = Depends(get_current_user)
 ):
     """Delete a sandbox session"""
@@ -254,7 +254,7 @@ async def delete_session(
     try:
         # Delete session and related messages
         await db_manager.execute_command("""
-            DELETE FROM sandbox_sessions 
+            DELETE FROM sandbox_sessions
             WHERE id = $1 AND user_id = $2
         """, session_id, current_user['id'])
 
@@ -264,7 +264,7 @@ async def delete_session(
 
 @router.post("/sandbox/sessions/{session_id}/messages")
 async def add_sandbox_message(
-    session_id: str,
+    session_id: int,
     message: SandboxMessage,
     current_user = Depends(get_current_user)
 ):
@@ -275,7 +275,7 @@ async def add_sandbox_message(
     try:
         # Verify session exists and belongs to user
         session = await db_manager.execute_one("""
-            SELECT * FROM sandbox_sessions 
+            SELECT * FROM sandbox_sessions
             WHERE id = $1 AND user_id = $2
         """, session_id, current_user['id'])
 
@@ -284,15 +284,15 @@ async def add_sandbox_message(
 
         # Add message
         result = await db_manager.execute_one("""
-            INSERT INTO chat_logs 
+            INSERT INTO chat_logs
             (chat_id, sandbox_session_id, user_id, role, content, mode)
-            VALUES ($1, $1, $2, $3, $4, 'sandbox')
+            VALUES ($1, $2, $3, $4, $5, 'sandbox')
             RETURNING id, created_at
-        """, session_id, current_user['id'], message.role, message.content)
+        """, str(session_id), session_id, current_user['id'], message.role, message.content)
 
         return {
             "id": str(result['id']),
-            "session_id": session_id,
+            "session_id": str(session_id),
             "role": message.role,
             "content": message.content,
             "created_at": result['created_at'].isoformat()
@@ -304,7 +304,7 @@ async def add_sandbox_message(
 
 @router.get("/sandbox/environments/{environment_id}/details")
 async def get_environment_details(
-    environment_id: str,
+    environment_id: int,
     current_user = Depends(get_current_user)
 ):
     """Get detailed information about a specific environment"""
@@ -330,7 +330,7 @@ async def get_environment_details(
         # Get session count for this environment
         session_count = await db_manager.execute_one("""
             SELECT COUNT(*) as count
-            FROM sandbox_sessions 
+            FROM sandbox_sessions
             WHERE environment_id = $1
         """, environment_id)
 
@@ -346,7 +346,7 @@ async def get_environment_details(
 
 @router.put("/sandbox/environments/{environment_id}")
 async def update_environment(
-    environment_id: str,
+    environment_id: int,
     env_data: EnvironmentCreate,
     current_user = Depends(get_current_user)
 ):
@@ -371,13 +371,13 @@ async def update_environment(
 
         # Update environment
         result = await db_manager.execute_one("""
-            UPDATE sandbox_environments 
-            SET name = $1, description = $2, system_prompt = $3, 
+            UPDATE sandbox_environments
+            SET name = $1, description = $2, system_prompt = $3,
                 model_config = $4, updated_at = CURRENT_TIMESTAMP
             WHERE id = $5
             RETURNING *
         """, env_data.name, env_data.description, env_data.system_prompt,
-            json.dumps(env_data.model_config), environment_id)
+            json.dumps(env_data.ai_config), environment_id)
 
         if result and result['model_config']:
             result_dict = dict(result)
@@ -393,14 +393,14 @@ async def update_environment(
 
 @router.post("/sandbox/{session_id}/chat/stream")
 async def sandbox_chat_stream(
-    session_id: str,
+    session_id: int,
     message: SandboxMessage,
     current_user = Depends(get_current_user)
 ):
     """Streaming chat endpoint for sandbox sessions"""
     if current_user['user_role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     try:
         # Get session and environment details
         session_data = await db_manager.execute_one("""
@@ -409,10 +409,16 @@ async def sandbox_chat_stream(
             JOIN sandbox_environments e ON s.environment_id = e.id
             WHERE s.id = $1 AND s.user_id = $2
         """, session_id, current_user['id'])
-        
+
         if not session_data:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
+        # Save user message first
+        await db_manager.execute_command("""
+            INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
+            VALUES ($1, $2, $3, 'user', $4, 'sandbox')
+        """, str(session_id), session_id, current_user['id'], message.content)
+
         # Get chat history for this session
         chat_history = await db_manager.execute_query("""
             SELECT role, content
@@ -421,17 +427,18 @@ async def sandbox_chat_stream(
             ORDER BY created_at ASC
             LIMIT 20
         """, session_id)
-        
+
         chat_history_list = [
             {"role": msg["role"], "content": msg["content"]}
             for msg in chat_history
             if msg["role"] in ['user', 'assistant']
         ]
-        
+
         async def generate_stream():
+            full_response = ""
             try:
                 loop = asyncio.get_event_loop()
-                
+
                 def token_generator():
                     return ask_question_stream(
                         message.content,
@@ -439,16 +446,25 @@ async def sandbox_chat_stream(
                         0.7,  # Could get from model_config
                         chat_history_list
                     )
-                
+
                 generator = await loop.run_in_executor(None, token_generator)
-                
+
                 for token in generator:
+                    full_response += token
                     yield f"data: {token}\n\n"
-                    
+
+                # Save assistant response
+                await db_manager.execute_command("""
+                    INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
+                    VALUES ($1, $2, $3, 'assistant', $4, 'sandbox')
+                """, str(session_id), session_id, current_user['id'], full_response)
+
+                yield "data: [DONE]\n\n"
+
             except Exception as e:
                 logging.error("Sandbox streaming error: %s", e)
                 yield f"data: Error generating response\n\n"
-        
+
         return StreamingResponse(
             generate_stream(),
             media_type="text/plain",
@@ -457,7 +473,7 @@ async def sandbox_chat_stream(
                 "Connection": "keep-alive",
             }
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
