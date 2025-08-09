@@ -72,8 +72,8 @@ class RequestQueue:
             self.not_full.notify()
             logger.info(f"Request released. Active: {self.active_requests}/{self.max_concurrent}")
 
-# Global request queue - limit concurrent model calls
-request_queue = RequestQueue(max_concurrent=15, max_queue_size=50)
+# Global request queue - increase concurrent limit since we have GPU headroom
+request_queue = RequestQueue(max_concurrent=25, max_queue_size=75)
 
 # Load sentence-transformer embedding model (optimized)
 @lru_cache(maxsize=1)
@@ -284,16 +284,16 @@ class AsyncLlamaService:
                 self.engine_args = AsyncEngineArgs(
                     model="meta-llama/Llama-3.2-3B-Instruct",
                     dtype="float16",
-                    gpu_memory_utilization=0.75,
+                    gpu_memory_utilization=0.80,  # Increased since we have headroom
                     max_model_len=2048,
-                    max_num_seqs=20,  # Allow 20 concurrent sequences
-                    max_num_batched_tokens=4096,
-                    enable_prefix_caching=False,  # Disable initially
+                    max_num_seqs=30,  # Increased to match queue capacity
+                    max_num_batched_tokens=8192,  # Increased for better batching
+                    enable_prefix_caching=False,
                     enable_chunked_prefill=False,
                     trust_remote_code=True,
                     tokenizer_mode="auto",
                     disable_log_stats=False,
-                    enforce_eager=False,  # Keep CUDA graphs enabled
+                    enforce_eager=True,  # Keep for stability
                 )
                 
                 self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
@@ -368,7 +368,7 @@ You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
             sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=1024,
-                stop=["<|eot_id|>", "<|end_of_text|>", "\n\nHuman:", "\n\nAssistant:"],
+                stop=["<|eot_id|>", "<|end_of_text|>"],
                 repetition_penalty=1.1,
                 top_p=0.95,
             )
@@ -378,19 +378,29 @@ You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
             
             # Generate and stream tokens
             full_response = ""
-            async for request_output in self.engine.generate(prompt, sampling_params, request_id):
-                if request_output.outputs:
+            results_generator = self.engine.generate(prompt, sampling_params, request_id)
+            
+            async for request_output in results_generator:
+                if request_output.outputs and len(request_output.outputs) > 0:
                     text = request_output.outputs[0].text
                     new_content = text[len(full_response):]
                     if new_content:
                         full_response = text
                         yield new_content
                     
+                    # Check if generation is complete
                     if request_output.finished:
+                        logger.info(f"Request {request_id[:20]}... completed successfully")
                         break
                         
+        except asyncio.CancelledError:
+            # Handle client disconnection gracefully
+            logger.info(f"Request cancelled by client")
+            raise
         except Exception as e:
             logger.error(f"Error in generate_stream: {e}")
+            import traceback
+            traceback.print_exc()
             yield f"Error generating response: {str(e)}"
         finally:
             # Always release the queue slot
