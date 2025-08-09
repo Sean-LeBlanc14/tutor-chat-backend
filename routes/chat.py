@@ -374,3 +374,31 @@ async def chat_health_check():
             "error": str(e),
             "concurrent_requests": request_metrics['concurrent_requests']
         }
+
+
+@router.get("/chat/queue-status")
+async def get_queue_status_endpoint():
+    """Get current queue and capacity status"""
+    from query_bot import get_queue_status
+    
+    status = get_queue_status()
+    
+    # Add health indicator
+    if status["capacity_percentage"] > 90:
+        status["health"] = "critical"
+    elif status["capacity_percentage"] > 70:
+        status["health"] = "high"
+    elif status["capacity_percentage"] > 50:
+        status["health"] = "moderate"
+    else:
+        status["health"] = "good"
+    
+    # Add wait time estimate
+    if status["queue_length"] > 0:
+        # Estimate ~2 seconds per queued request
+        status["estimated_wait_seconds"] = status["queue_length"] * 2
+    else:
+        status["estimated_wait_seconds"] = 0
+    
+    return status
+
