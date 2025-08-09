@@ -1,4 +1,4 @@
-# routes/chat.py - Optimized for classroom concurrency
+# routes/chat.py - True async concurrency for classroom scale
 """ This module handles all database interactions for the regular chat environment """
 import asyncio
 import logging
@@ -137,12 +137,12 @@ async def delete_chat(chat_id: str, user_email: str):
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(data: QuestionRequest):
     """
-    Non-streaming chat endpoint with performance optimizations
+    Non-streaming chat endpoint - now truly async
     """
     start_time = time.time()
     request_metrics['total_requests'] += 1
     request_metrics['concurrent_requests'] += 1
-    
+
     try:
         # Optimized chat history retrieval
         chat_history = []
@@ -165,10 +165,8 @@ async def chat_endpoint(data: QuestionRequest):
             except Exception as e:
                 logging.warning(f"Could not fetch chat history for {data.chat_id}: {e}")
 
-        # Use sync ask_question function
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            ask_question,
+        # Use truly async ask_question function
+        result = await ask_question(
             data.question,
             data.system_prompt,
             data.temperature,
@@ -206,11 +204,11 @@ async def chat_endpoint(data: QuestionRequest):
 @router.post("/chat/stream")
 async def chat_stream_endpoint(data: QuestionRequest):
     """
-    Optimized streaming chat endpoint for classroom scale
+    TRUE async streaming endpoint - no blocking!
     """
     import os
     from starlette.responses import StreamingResponse
-    
+
     start_time = time.time()
     request_metrics['total_requests'] += 1
     request_metrics['concurrent_requests'] += 1
@@ -238,28 +236,23 @@ async def chat_stream_endpoint(data: QuestionRequest):
                 logging.warning(f"Could not fetch chat history for {data.chat_id}: {e}")
 
         async def generate_stream():
-            """Optimized streaming generator"""
+            """TRUE async streaming generator - no blocking!"""
             try:
                 token_count = 0
-                
-                # Use the sync streaming function in thread pool
-                loop = asyncio.get_event_loop()
-                generator = await loop.run_in_executor(
-                    None,
-                    ask_question_stream,
+
+                # Direct async streaming - no executors, no blocking!
+                async for token in ask_question_stream(
                     data.question,
                     data.system_prompt,
                     data.temperature,
                     chat_history
-                )
-                
-                for token in generator:
+                ):
                     token_count += 1
                     yield f"data: {token}\n\n"
-                    
-                    # Add small delay every few tokens to prevent overwhelming
-                    if token_count % 10 == 0:
-                        await asyncio.sleep(0.01)  # 10ms pause
+
+                    # Optional: Add small delay for client processing
+                    if token_count % 20 == 0:
+                        await asyncio.sleep(0.001)  # 1ms pause
 
                 # Send completion signal
                 yield "data: [DONE]\n\n"
@@ -275,7 +268,7 @@ async def chat_stream_endpoint(data: QuestionRequest):
             generate_stream(),
             media_type="text/event-stream"
         )
-        
+
         # Add CORS and caching headers
         response.headers["Access-Control-Allow-Origin"] = os.getenv("FRONTEND_URL", "*")
         response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -316,13 +309,13 @@ async def get_chat_metrics():
 @router.post("/chat/batch")
 async def batch_chat_endpoint(requests: list[QuestionRequest]):
     """
-    Batch processing endpoint for multiple questions (future enhancement)
+    Batch processing endpoint - now truly concurrent!
     """
     if len(requests) > 10:  # Limit batch size
         raise HTTPException(status_code=400, detail="Maximum 10 requests per batch")
-    
+
     try:
-        # Process requests concurrently with semaphore control
+        # Process requests truly concurrently with async
         tasks = []
         for req in requests:
             task = ask_question(
@@ -332,10 +325,10 @@ async def batch_chat_endpoint(requests: list[QuestionRequest]):
                 []  # No history for batch requests
             )
             tasks.append(task)
-        
-        # Execute all requests concurrently
+
+        # Execute all requests truly concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Format responses
         responses = []
         for i, result in enumerate(results):
@@ -351,9 +344,9 @@ async def batch_chat_endpoint(requests: list[QuestionRequest]):
                     "response": result,
                     "status": "success"
                 })
-        
+
         return {"responses": responses}
-        
+
     except Exception as e:
         logging.error(f"Batch endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
@@ -363,9 +356,9 @@ async def batch_chat_endpoint(requests: list[QuestionRequest]):
 async def chat_health_check():
     """Health check specific to chat functionality"""
     try:
-        # Quick test of the model
+        # Quick test of the model - now truly async
         test_response = await ask_question("Hi", temperature=0.1)
-        
+
         return {
             "status": "healthy",
             "model_responsive": bool(test_response),

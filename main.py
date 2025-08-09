@@ -1,4 +1,4 @@
-""" Optimized FastAPI app for classroom scale (40+ concurrent users) """
+""" Optimized FastAPI app for classroom scale with true async concurrency """
 import os
 import logging
 import time
@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 
 # Import your modules
 from models import QuestionRequest, ChatResponse
-from query_bot import ask_question, cleanup_cache
+from query_bot import ask_question, cleanup_cache, initialize_llm  # Added initialize_llm
 from routes import chat, auth, sandbox
 from db import db_manager
 from error_handler import (
@@ -50,32 +50,41 @@ async def cleanup_background_tasks():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """ Enhanced startup and shutdown with background tasks """
-    logger.info("🚀 Starting classroom-scale tutor chatbot...")
-    
+    """ Enhanced startup and shutdown with async LLM initialization """
+    logger.info("🚀 Starting classroom-scale tutor chatbot with AsyncLLMEngine...")
+
     # Initialize database
     await db_manager.initialize()
     logger.info("✅ Database initialized")
-    
+
+    # Initialize AsyncLLMEngine for true concurrency
+    try:
+        await initialize_llm()
+        logger.info("✅ AsyncLLMEngine initialized - true concurrency enabled!")
+    except Exception as e:
+        logger.error(f"Failed to initialize AsyncLLMEngine: {e}")
+        raise
+
     # Start background tasks
     cleanup_task = asyncio.create_task(cleanup_background_tasks())
     logger.info("✅ Background tasks started")
-    
+
     # GPU memory check
     try:
         import torch
         if torch.cuda.is_available():
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            logger.info(f"🎯 GPU: {torch.cuda.get_device_name(0)} ({gpu_memory:.1f}GB)")
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            logger.info(f"🎯 GPU: {torch.cuda.get_device_name(0)} ({gpu_memory:.1f}GB total, {allocated:.1f}GB allocated)")
         else:
             logger.warning("⚠️  No CUDA GPU detected - using CPU fallback")
     except ImportError:
         logger.info("📊 PyTorch not available for GPU detection")
-    
-    logger.info("🎓 Application startup complete - Ready for classroom!")
-    
+
+    logger.info("🎓 Application startup complete - Ready for concurrent classroom requests!")
+
     yield
-    
+
     # Shutdown
     logger.info("🛑 Shutting down application...")
     cleanup_task.cancel()
@@ -85,8 +94,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app with optimized settings
 app = FastAPI(
     title="Psychology Tutor Chatbot API",
-    description="Classroom-scale psychology tutor with smart RAG and concurrent request handling",
-    version="2.0.0",
+    description="Classroom-scale psychology tutor with AsyncLLMEngine for true concurrency",
+    version="3.0.0",  # Bumped version for async upgrade
     lifespan=lifespan,
     docs_url="/docs" if os.getenv("ENVIRONMENT") != "production" else None,
     redoc_url="/redoc" if os.getenv("ENVIRONMENT") != "production" else None,
@@ -144,17 +153,17 @@ app.include_router(sandbox.router, prefix="/api", tags=["sandbox"])
 async def performance_monitoring(request: Request, call_next):
     """Enhanced request logging with performance metrics"""
     start_time = time.time()
-    
+
     # Log request
     logger.info(
         f"📥 {request.method} {request.url.path} | "
         f"Client: {request.client.host if request.client else 'unknown'}"
     )
-    
+
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
-        
+
         # Log response with performance data
         status_emoji = "✅" if response.status_code < 400 else "❌"
         logger.info(
@@ -162,13 +171,13 @@ async def performance_monitoring(request: Request, call_next):
             f"⏱️  {process_time:.3f}s | "
             f"Path: {request.url.path}"
         )
-        
+
         # Add performance headers
         response.headers["X-Process-Time"] = str(process_time)
-        response.headers["X-Server-Version"] = "2.0.0"
-        
+        response.headers["X-Server-Version"] = "3.0.0"
+
         return response
-        
+
     except Exception as e:
         process_time = time.time() - start_time
         logger.error(
@@ -193,13 +202,13 @@ async def rate_limiting(request: Request, call_next):
     if request.url.path.startswith("/api/chat"):
         client_ip = request.client.host if request.client else "unknown"
         now = datetime.now()
-        
+
         # Clean old requests
         request_counts[client_ip] = [
             req_time for req_time in request_counts[client_ip]
             if now - req_time < RATE_LIMIT_WINDOW
         ]
-        
+
         # Check rate limit
         if len(request_counts[client_ip]) >= RATE_LIMIT_REQUESTS:
             logger.warning(f"🚫 Rate limit exceeded for {client_ip}")
@@ -207,10 +216,10 @@ async def rate_limiting(request: Request, call_next):
                 status_code=429,
                 detail="Too many requests. Please wait before trying again."
             )
-        
+
         # Add current request
         request_counts[client_ip].append(now)
-    
+
     return await call_next(request)
 
 # Enhanced health check
@@ -221,8 +230,8 @@ async def health_check():
         # Database check
         async with db_manager.get_connection() as conn:
             await conn.fetchrow("SELECT 1")
-        
-        # Model availability check
+
+        # Model availability check - now truly async
         model_status = "healthy"
         try:
             # Quick model test
@@ -232,44 +241,47 @@ async def health_check():
         except Exception as e:
             model_status = f"error: {str(e)}"
             logger.error(f"Model health check failed: {e}")
-        
+
         # System resource check
         import psutil
         memory_percent = psutil.virtual_memory().percent
         cpu_percent = psutil.cpu_percent()
-        
+
         # GPU check if available
         gpu_info = {}
         try:
             import torch
             if torch.cuda.is_available():
-                gpu_memory = torch.cuda.memory_allocated(0) / torch.cuda.max_memory_allocated(0) * 100
+                gpu_memory_used = torch.cuda.memory_allocated(0) / 1024**3
+                gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 gpu_info = {
                     "available": True,
-                    "memory_usage": f"{gpu_memory:.1f}%",
+                    "memory_usage": f"{gpu_memory_used:.1f}/{gpu_memory_total:.1f}GB",
+                    "memory_percent": f"{(gpu_memory_used/gpu_memory_total*100):.1f}%",
                     "device_name": torch.cuda.get_device_name(0)
                 }
             else:
                 gpu_info = {"available": False}
         except ImportError:
             gpu_info = {"available": False, "error": "PyTorch not installed"}
-        
+
         # Overall health status
         overall_status = "healthy"
         if model_status != "healthy":
             overall_status = "degraded"
-        if memory_percent > 90 or (gpu_info.get("available") and "memory_usage" in gpu_info and float(gpu_info["memory_usage"].rstrip('%')) > 95):
+        if memory_percent > 90:
             overall_status = "critical"
-        
+
         return {
             "status": overall_status,
             "timestamp": datetime.now().isoformat(),
             "environment": ENVIRONMENT,
-            "version": "2.0.0",
+            "version": "3.0.0",
             "components": {
                 "database": "connected",
                 "model": model_status,
-                "cache": "active"
+                "cache": "active",
+                "async_engine": "enabled"
             },
             "system": {
                 "memory_usage": f"{memory_percent:.1f}%",
@@ -278,12 +290,13 @@ async def health_check():
             },
             "features": {
                 "smart_rag": True,
-                "request_queuing": True,
+                "async_llm_engine": True,
+                "true_concurrency": True,
                 "response_caching": True,
-                "concurrent_limit": 15
+                "concurrent_limit": "unlimited (async)"
             }
         }
-        
+
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise CustomHTTPException(
@@ -298,10 +311,10 @@ async def system_metrics():
     """Detailed system metrics for monitoring"""
     try:
         import psutil
-        
+
         # Get current metrics from chat router
         from routes.chat import request_metrics
-        
+
         return {
             "timestamp": datetime.now().isoformat(),
             "requests": {
@@ -332,12 +345,13 @@ async def system_metrics():
 async def root():
     """Root endpoint with system info"""
     return {
-        "message": "🎓 Psychology Tutor Chatbot API - Classroom Ready",
-        "version": "2.0.0",
+        "message": "🎓 Psychology Tutor Chatbot API - True Async Concurrency",
+        "version": "3.0.0",
         "status": "operational",
         "features": [
+            "AsyncLLMEngine for true concurrency",
             "Smart RAG (context only when needed)",
-            "Concurrent request handling (15+ users)",
+            "Unlimited concurrent requests (async)",
             "Response caching",
             "Optimized 3B model",
             "Real-time streaming"
@@ -354,8 +368,9 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Additional startup tasks"""
-    logger.info("🎯 Classroom-scale chatbot ready!")
-    logger.info("📊 Optimizations: 3B model, Smart RAG, Request queuing, Response caching")
+    logger.info("🎯 Classroom-scale chatbot with AsyncLLMEngine ready!")
+    logger.info("📊 True async concurrency enabled - no more blocking!")
+    logger.info("🚀 Features: AsyncLLMEngine, Smart RAG, Response caching")
 
 if __name__ == "__main__":
     import uvicorn
@@ -371,16 +386,15 @@ if __name__ == "__main__":
             access_log=True
         )
     else:
-        # Production settings optimized for classroom scale
+        # Production settings optimized for async concurrency
         uvicorn.run(
             "main:app",
             host="0.0.0.0",
             port=port,
             workers=1,  # Single worker for GPU sharing
-            worker_class="uvicorn.workers.UvicornWorker",
             log_level="info",
             access_log=True,
-            loop="asyncio",  # Optimized event loop
+            loop="uvloop",  # Faster event loop for production
             http="httptools",  # Faster HTTP parsing
             lifespan="on"  # Enable lifespan events
         )

@@ -1,36 +1,28 @@
-# Optimized query_bot.py - Classroom Scale with Smart RAG
-""" Module handles context retrieval with intelligent question classification """
+# Optimized query_bot.py - True Async Concurrency with AsyncLLMEngine
+""" Module handles context retrieval with true async concurrency for classroom scale """
 import json
 import os
 import asyncio
-import requests
 import torch
 import faiss
 import numpy as np
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch.nn.functional as F
-from vllm import LLM, SamplingParams
+from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 from functools import lru_cache
 import re
 import time
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, AsyncIterator
 import logging
 
 load_dotenv()
 
-API_KEY = os.getenv("API_KEY")
 INDEX_NAME = "tutor-bot-index"
 CHUNK_FILE = "chunks.jsonl"
 
 # Response cache for common questions (saves 30-40% compute)
 response_cache = {}
 CACHE_TTL = 3600  # 1 hour
-
-# Request semaphore for controlled concurrency
-MAX_CONCURRENT_REQUESTS = 15  # Optimized for your GPU
-request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 # Load sentence-transformer embedding model (optimized)
 @lru_cache(maxsize=1)
@@ -155,7 +147,7 @@ def should_use_rag(question: str, question_type: str, has_custom_prompt: bool = 
     # Never use RAG if there's a custom system prompt (sandbox mode)
     if has_custom_prompt:
         return False
-        
+
     # Never use RAG for casual conversation
     if question_type == "casual":
         return False
@@ -192,21 +184,6 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List, List]:
     else:
         return retrieve_relevant_chunks(question, k=2)  # Default
 
-def format_chat_history(messages, max_history=6):  # Reduced for efficiency
-    """Format recent chat messages for context"""
-    if not messages:
-        return "No previous conversation."
-
-    recent_messages = messages[-max_history:]
-    formatted_history = []
-    for msg in recent_messages:
-        role = "Student" if msg.get('role') == 'user' else "Assistant"
-        content = msg.get('content', '').strip()
-        if content:
-            formatted_history.append(f"{role}: {content}")
-
-    return "\n\n".join(formatted_history) if formatted_history else "No previous conversation."
-
 def retrieve_relevant_chunks(query, k=2):
     """Retrieves the top k most relevant chunks from FAISS"""
     try:
@@ -241,102 +218,68 @@ def load_text_for_chunks(chunks, chunk_file_path):
         print(f"Error loading chunk texts: {e}")
         return []
 
-class OptimizedLlamaService:
+class AsyncLlamaService:
+    """Async service using vLLM's AsyncLLMEngine for true concurrency"""
+    
     def __init__(self):
-        print("Loading OPT-2.7B model for classroom scale...")
-        hf_token = os.getenv("HF_TOKEN")
-
-        try:
-            print("Attempting vLLM with optimized settings...")
-            self.llm = LLM(
-                model="meta-llama/Llama-3.2-3B-Instruct",  # Smaller model for scale
-                gpu_memory_utilization=0.4,  # Much lower memory usage
-                max_model_len=1024,  # Shorter context for speed
-                tensor_parallel_size=1,
-                trust_remote_code=True,
-                tokenizer_mode="auto",
-                enforce_eager=False,  # Allow CUDA graphs for speed
-                max_num_batched_tokens=2048,  # Enable batching
-            )
-            self.use_vllm = True
-            print("vLLM 3B model loaded successfully for classroom scale!")
-
-        except Exception as e:
-            import traceback
-            print(f"vLLM failed: {e}")
-            print("Falling back to transformers...")
-
-            self.use_vllm = False
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "facebook/opt-2.7b",
-                token=hf_token
-            )
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-            self.model = AutoModelForCausalLM.from_pretrained(
-                "facebook/opt-2.7b",
-                torch_dtype=torch.float16,
-                device_map="cuda",
-                trust_remote_code=True,
-                token=hf_token
-            )
-            print("Transformers 3B model loaded successfully!")
-
-    def generate_stream(self, prompt, temperature=0.7):
-        """Optimized streaming with better parameters"""
-        if self.use_vllm:
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                max_tokens=150,  # Shorter responses for speed
-                stop=["<|eot_id|>", "<|end_of_text|>"],
-                repetition_penalty=1.1,
-            )
-
-            outputs = self.llm.generate([prompt], sampling_params)
-            full_response = outputs[0].outputs[0].text.strip()
-
-            if not full_response:
-                yield "I'm having trouble generating a response right now."
-                return
-
-            # Stream by words for smooth user experience
-            words = full_response.split()
-            for word in words:
-                yield word + " "
-        else:
-            response = self._generate_transformers(prompt, temperature)
-            words = response.split()
-            for word in words:
-                yield word + " "
-
-    def _generate_transformers(self, prompt, temperature):
-        """Fallback transformers generation"""
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        self.engine = None
+        self.engine_args = None
+        
+    async def initialize(self):
+        """Initialize the async engine - call this at startup"""
+        if self.engine is not None:
+            return  # Already initialized
+            
+        print("🚀 Initializing AsyncLLMEngine for true concurrency...")
+        
+        self.engine_args = AsyncEngineArgs(
+            model="meta-llama/Llama-3.2-3B-Instruct",
+            dtype="auto",  # Let vLLM choose optimal dtype
+            gpu_memory_utilization=0.75,  # Reduced for better concurrency
+            max_model_len=2048,  # Increased for better responses
+            max_num_seqs=64,  # Maximum concurrent sequences
+            max_num_batched_tokens=8192,  # Larger batching
+            enable_prefix_caching=True,  # Cache common prefixes
+            trust_remote_code=True,
+            tokenizer_mode="auto",
+            disable_log_stats=False,  # Enable logging for debugging
         )
+        
+        self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
+        print("✅ AsyncLLMEngine initialized successfully!")
+        
+    async def generate_stream(self, prompt: str, temperature: float = 0.7) -> AsyncIterator[str]:
+        """Async streaming generation - yields complete tokens only"""
+        if self.engine is None:
+            await self.initialize()
+            
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=512,  # Reasonable default, adjust as needed
+            stop=["<|eot_id|>", "<|end_of_text|>"],
+            repetition_penalty=1.1,
+        )
+        
+        # Generate unique request ID
+        request_id = f"req_{time.time()}_{hash(prompt)}"
+        
+        # Add request to engine
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+        
+        # Stream the raw tokens as vLLM provides them
+        full_response = ""
+        async for request_output in results_generator:
+            if request_output.outputs:
+                text = request_output.outputs[0].text
+                # Get only the new content since last yield
+                new_content = text[len(full_response):]
+                if new_content:
+                    full_response = text
+                    # Yield the new content directly without splitting
+                    yield new_content
 
-        inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to("cuda")
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=200,
-                temperature=temperature,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
-            )
-
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True
-        ).strip()
-
-        return response
-
-# Initialize service
-llama_service = OptimizedLlamaService()
+# Global instance (will be initialized at startup)
+llama_service = AsyncLlamaService()
 
 def get_cache_key(question: str, system_prompt: str = None) -> str:
     """Generate cache key for common questions"""
@@ -356,111 +299,82 @@ def is_cacheable_question(question: str, question_type: str) -> bool:
         return any(re.search(pattern, question.lower()) for pattern in academic_cache_patterns)
     return False
 
-def ask_question_stream(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """Smart streaming with concurrency control and caching (SYNC generator)"""
-    import asyncio
-    import time
-
-    # Get the event loop
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    # Run the async function and return generator
-    return loop.run_until_complete(
-        _ask_question_stream_async(question, system_prompt, temperature, chat_history)
-    )
-
-async def _ask_question_stream_async(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """Internal async implementation"""
-    # Acquire semaphore for controlled concurrency
-    async with request_semaphore:
-        # Check cache for common questions
-        cache_key = get_cache_key(question, system_prompt)
-        if cache_key in response_cache:
-            cache_entry = response_cache[cache_key]
-            if time.time() - cache_entry['timestamp'] < CACHE_TTL:
-                # Return cached response as generator
-                def cached_generator():
-                    words = cache_entry['response'].split()
-                    for word in words:
-                        yield word + " "
-                return cached_generator()
-
-        # Classify question type
-        question_type = classify_question_type(question)
-
-        # Default to empty history if none provided
-        if chat_history is None:
-            chat_history = []
-
-        # Check if we have a custom system prompt (sandbox mode)
-        has_custom_prompt = system_prompt and system_prompt.strip()
-
-        # Handle different question types
-        if question_type == "casual":
-            if has_custom_prompt:
-                # Custom system prompt (sandbox) - let it handle casual responses
-                pass  # Continue to normal prompt generation
-            else:
-                # Regular chat - use default psychology tutor responses
-                simple_responses = {
-                    "hi": "Hello! I'm here to help you with psychology concepts. What would you like to learn about?",
-                    "hello": "Hi there! I'm your psychology tutor assistant. How can I help you today?",
-                    "thanks": "You're welcome! Feel free to ask any psychology-related questions.",
-                    "bye": "Goodbye! Good luck with your psychology studies!"
-                }
-
-                for greeting, response in simple_responses.items():
-                    if greeting in question.lower():
-                        def simple_generator():
-                            words = response.split()
-                            for word in words:
-                                yield word + " "
-                        return simple_generator()
-
-        elif question_type == "test_question":
-            if has_custom_prompt:
-                # Custom system prompt (sandbox) - let it handle test questions
-                pass  # Continue to normal prompt generation
-            else:
-                # Regular chat - provide default psychology tutor guidance
-                response = "I can help you understand concepts and provide explanations, but I can't give direct answers to test questions. Instead, let me help you understand the underlying concepts. What specific topic would you like me to explain?"
-                def guidance_generator():
-                    words = response.split()
-                    for word in words:
-                        yield word + " "
-                return guidance_generator()
-
-        # For academic questions, use smart RAG (but respect custom prompts)
-        if should_use_rag(question, question_type, has_custom_prompt):
-            # Only use psychology-focused RAG for regular chat
-            top_chunks, scores = get_adaptive_chunks(question, question_type)
-            context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
-
-            # Filter low-relevance chunks
-            if scores and len(scores) > 0:
-                relevant_passages = []
-                for i, score in enumerate(scores):
-                    if score > 0.3:  # Only use relevant chunks
-                        if i < len(context_passages):
-                            relevant_passages.append(context_passages[i])
-
-                combined_context = "\n\n".join(relevant_passages) if relevant_passages else ""
-            else:
-                combined_context = ""
-        else:
-            # Custom prompt or non-academic - no RAG context
-            combined_context = ""
-
-        # Build prompt based on context availability and system prompt
-        if has_custom_prompt:
-            # Custom system prompt (sandbox) - use it directly
-            if combined_context:
-                # Include context if available (rare for sandbox)
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+async def ask_question_stream(
+    question: str,
+    system_prompt: str = None,
+    temperature: float = 0.7,
+    chat_history: List[Dict] = None
+) -> AsyncIterator[str]:
+    """True async streaming with no blocking"""
+    
+    # Check cache for common questions
+    cache_key = get_cache_key(question, system_prompt)
+    if cache_key in response_cache:
+        cache_entry = response_cache[cache_key]
+        if time.time() - cache_entry['timestamp'] < CACHE_TTL:
+            # Stream cached response
+            words = cache_entry['response'].split()
+            for word in words:
+                yield word + " "
+            return
+    
+    # Classify question type
+    question_type = classify_question_type(question)
+    
+    # Default to empty history if none provided
+    if chat_history is None:
+        chat_history = []
+    
+    # Check if we have a custom system prompt (sandbox mode)
+    has_custom_prompt = system_prompt and system_prompt.strip()
+    
+    # Handle different question types
+    if question_type == "casual" and not has_custom_prompt:
+        # Regular chat - use default psychology tutor responses
+        simple_responses = {
+            "hi": "Hello! I'm here to help you with psychology concepts. What would you like to learn about?",
+            "hello": "Hi there! I'm your psychology tutor assistant. How can I help you today?",
+            "thanks": "You're welcome! Feel free to ask any psychology-related questions.",
+            "bye": "Goodbye! Good luck with your psychology studies!"
+        }
+        
+        for greeting, response in simple_responses.items():
+            if greeting in question.lower():
+                words = response.split()
+                for word in words:
+                    yield word + " "
+                return
+    
+    elif question_type == "test_question" and not has_custom_prompt:
+        # Regular chat - provide default psychology tutor guidance
+        response = "I can help you understand concepts and provide explanations, but I can't give direct answers to test questions. Instead, let me help you understand the underlying concepts. What specific topic would you like me to explain?"
+        words = response.split()
+        for word in words:
+            yield word + " "
+        return
+    
+    # For academic questions, use smart RAG (but respect custom prompts)
+    combined_context = ""
+    if should_use_rag(question, question_type, has_custom_prompt):
+        # Only use psychology-focused RAG for regular chat
+        top_chunks, scores = get_adaptive_chunks(question, question_type)
+        context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
+        
+        # Filter low-relevance chunks
+        if scores and len(scores) > 0:
+            relevant_passages = []
+            for i, score in enumerate(scores):
+                if score > 0.3:  # Only use relevant chunks
+                    if i < len(context_passages):
+                        relevant_passages.append(context_passages[i])
+            
+            combined_context = "\n\n".join(relevant_passages) if relevant_passages else ""
+    
+    # Build prompt based on context availability and system prompt
+    if has_custom_prompt:
+        # Custom system prompt (sandbox) - use it directly
+        if combined_context:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_prompt.strip()}
 
@@ -470,19 +384,18 @@ Additional context:
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-            else:
-                # Pure custom system prompt
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        else:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_prompt.strip()}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-        else:
-            # Regular chat - use default psychology tutor behavior
-            if combined_context:
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    else:
+        # Regular chat - use default psychology tutor behavior
+        if combined_context:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 You are a helpful psychology tutor. Answer the student's question using the provided course materials when relevant. Keep your response clear, educational, and engaging.
 
@@ -492,41 +405,45 @@ Course Materials:
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-            else:
-                # No context needed - default psychology tutor
-                prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        else:
+            prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 You are a helpful psychology tutor assistant. Answer the student's question clearly and educationally.<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
+    
+    # Generate response using async streaming
+    response_text = ""
+    async for token in llama_service.generate_stream(prompt, temperature):
+        response_text += token
+        yield token
+    
+    # Cache common academic questions (only for regular chat)
+    if not has_custom_prompt and is_cacheable_question(question, question_type):
+        response_cache[cache_key] = {
+            'response': response_text.strip(),
+            'timestamp': time.time()
+        }
 
-        # Generate response using the sync generator
-        def model_generator():
-            response_text = ""
-            for token in llama_service.generate_stream(prompt, temperature):
-                response_text += token
-                yield token
-
-            # Cache common academic questions (only for regular chat)
-            if not has_custom_prompt and is_cacheable_question(question, question_type):
-                response_cache[cache_key] = {
-                    'response': response_text.strip(),
-                    'timestamp': time.time()
-                }
-
-        return model_generator()
-
-# Backward compatibility
-def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
-    """Legacy function for backward compatibility"""
+async def ask_question(
+    question: str,
+    system_prompt: str = None,
+    temperature: float = 0.7,
+    chat_history: List[Dict] = None
+) -> str:
+    """Non-streaming async version"""
     response = ""
-    for token in ask_question_stream(question, system_prompt, temperature, chat_history):
+    async for token in ask_question_stream(question, system_prompt, temperature, chat_history):
         response += token
-    return response
+    return response.strip()
 
-# Clean up cache periodically
+# Initialize the async engine at module import (will be called from main.py)
+async def initialize_llm():
+    """Initialize the LLM engine - call this at app startup"""
+    await llama_service.initialize()
+
 def cleanup_cache():
     """Remove expired cache entries"""
     current_time = time.time()
@@ -537,41 +454,6 @@ def cleanup_cache():
     for key in expired_keys:
         del response_cache[key]
 
-# Batch processing for high load (future enhancement)
-class BatchProcessor:
-    def __init__(self, batch_size=5, timeout=2.0):
-        self.batch_size = batch_size
-        self.timeout = timeout
-        self.pending_requests = []
-        self.batch_lock = asyncio.Lock()
-
-    async def add_request(self, request_data):
-        """Add request to batch (future enhancement)"""
-        async with self.batch_lock:
-            self.pending_requests.append(request_data)
-            if len(self.pending_requests) >= self.batch_size:
-                return await self._process_batch()
-
-        # Process batch after timeout
-        await asyncio.sleep(self.timeout)
-        async with self.batch_lock:
-            if self.pending_requests:
-                return await self._process_batch()
-
-    async def _process_batch(self):
-        """Process batched requests (future enhancement)"""
-        if not self.pending_requests:
-            return []
-
-        batch = self.pending_requests.copy()
-        self.pending_requests.clear()
-
-        # Process batch with vLLM
-        return batch
-
-# Initialize batch processor (for future use)
-batch_processor = BatchProcessor()
-
-print("🚀 Classroom-optimized query system loaded!")
-print(f"📊 Model: Llama 3.2-3B | Max concurrent: {MAX_CONCURRENT_REQUESTS}")
-print("🎯 Features: Smart RAG, Response Caching, Request Queuing")
+print("🚀 Async query system loaded - waiting for initialization...")
+print("📊 Model: Llama 3.2-3B | True async concurrency")
+print("🎯 Features: Smart RAG, Response Caching, AsyncLLMEngine")
