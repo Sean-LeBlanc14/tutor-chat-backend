@@ -124,7 +124,7 @@ async def get_sessions(
     try:
         # Convert environment_id to int
         env_id = int(environment_id)
-        
+
         # Get sessions for this environment and user
         sessions = await db_manager.execute_query("""
             SELECT s.*,
@@ -156,7 +156,7 @@ async def get_sessions(
                 session_id = msg['sandbox_session_id']
                 if session_id not in grouped_messages:
                     grouped_messages[session_id] = []
-                
+
                 # Skip system messages from display
                 if msg['role'] != 'system':
                     grouped_messages[session_id].append({
@@ -437,19 +437,16 @@ async def sandbox_chat_stream(
         async def generate_stream():
             full_response = ""
             try:
-                loop = asyncio.get_event_loop()
+                # Call ask_question_stream directly (it's already async)
+                async_generator = ask_question_stream(
+                    message.content,
+                    session_data['system_prompt'],  # Use environment's system prompt
+                    0.7,  # Could get from model_config
+                    chat_history_list
+                )
 
-                def token_generator():
-                    return ask_question_stream(
-                        message.content,
-                        session_data['system_prompt'],  # Use environment's system prompt
-                        0.7,  # Could get from model_config
-                        chat_history_list
-                    )
-
-                generator = await loop.run_in_executor(None, token_generator)
-
-                for token in generator:
+                # Use async for to iterate over the async generator
+                async for token in async_generator:
                     full_response += token
                     yield f"data: {token}\n\n"
 

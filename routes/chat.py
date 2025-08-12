@@ -29,7 +29,7 @@ async def get_user_chats(user_email: str):
             SELECT chat_id, role, content, created_at, id, title
             FROM chat_logs
             WHERE user_email = $1 AND mode = 'chat'
-            ORDER BY created_at DESC
+            ORDER BY created_at ASC
             LIMIT 100
         """, user_email)
 
