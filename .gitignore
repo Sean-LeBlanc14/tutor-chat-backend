@@ -107,3 +107,47 @@ keys.txt
 Dr.Mishra-Materials
 texts
 start-with-gpu.sh
+metadata
+docker-compose.yml
+
+# FAISS and Vector Store files
+faiss_index.bin
+faiss_metadata.pkl
+*.faiss
+*.index
+vector_store/
+embeddings/
+
+# Data processing artifacts
+chunks.jsonl
+chunks_*.jsonl
+chunks_backup.jsonl
+*.jsonl
+
+# Extracted content (since you can regenerate)
+texts/
+metadata/
+extraction_summary.json
+
+# Large model files
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pb
+sentence_transformers_cache/
+.cache/
+
+# Pinecone remnants (if any)
+pinecone_index/
+
+# Test outputs
+test_*.txt
+test_*.json
+*_test.py
+
+# Backup and temporary processing files
+*.tmp
+*.temp
+*_old.*
+*_backup.*
