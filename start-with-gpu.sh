@@ -3,7 +3,7 @@
 docker stop tutor_chatbot_backend 2>/dev/null
 docker rm tutor_chatbot_backend 2>/dev/null
 
-# Start with GPU access and FAISS file mounts
+# Start with GPU access and UPDATED FAISS file mounts
 docker run -d \
   --name tutor_chatbot_backend \
   --gpus all \
@@ -12,8 +12,8 @@ docker run -d \
   --network host \
   --env-file .env \
   -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/chunk_index.faiss:/app/chunk_index.faiss \
-  -v $(pwd)/chunk_metadata.json:/app/chunk_metadata.json \
+  -v $(pwd)/faiss_index.bin:/app/faiss_index.bin \
+  -v $(pwd)/faiss_metadata.pkl:/app/faiss_metadata.pkl \
   -v $(pwd)/chunks.jsonl:/app/chunks.jsonl \
   --health-cmd="curl -f http://localhost:8080/api/health" \
   --health-interval=60s \
@@ -38,7 +38,21 @@ except Exception as e:
 "
 
 echo "Checking FAISS files..."
-docker exec tutor_chatbot_backend ls -la chunk_*.* || echo "FAISS files not found - add them after GitHub commit"
+docker exec tutor_chatbot_backend ls -la faiss_* chunks.jsonl || echo "FAISS files not found - need to generate them"
+
+echo "Testing FAISS loading..."
+docker exec tutor_chatbot_backend python -c "
+import pickle
+import faiss
+try:
+    index = faiss.read_index('faiss_index.bin')
+    with open('faiss_metadata.pkl', 'rb') as f:
+        data = pickle.load(f)
+    print(f'✅ FAISS index loaded: {index.ntotal} vectors')
+    print(f'✅ Metadata loaded: {len(data.get(\"metadata\", []))} chunks')
+except Exception as e:
+    print(f'❌ FAISS loading error: {e}')
+"
 
 echo "Container logs:"
 docker logs tutor_chatbot_backend --tail 20

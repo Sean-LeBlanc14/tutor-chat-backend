@@ -42,6 +42,7 @@ PyMuPDF==1.26.1
 python-docx==1.2.0
 python-pptx==1.0.2
 lxml==6.0.0
+openpyxl==3.1.2
 xlsxwriter==3.2.5
 
 # JWT and authentication

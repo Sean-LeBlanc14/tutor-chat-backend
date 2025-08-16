@@ -4,10 +4,10 @@ FROM python:3.11-slim AS builder
 # Set build arguments
 ARG ENVIRONMENT=production
 
-# Install system dependencies
+# Install system dependencies (updated package names)
 RUN apt-get update && apt-get install -y \
     build-essential \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     poppler-utils \
     git \
@@ -26,16 +26,14 @@ COPY requirements.txt .
 # Install Python dependencies (including vLLM)
 RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Pre-download models to cache them - REMOVED to fix permissions
-# RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-
 # Production stage
 FROM python:3.11-slim
 
-# Install runtime dependencies
+# Install runtime dependencies (updated package names)
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
+    libgomp1 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -57,8 +55,8 @@ COPY --from=builder /root/.local /home/appuser/.local
 # Copy application code
 COPY --chown=appuser:appuser . .
 
-# Make sure FAISS files are in the right place (you'll add these after GitHub commit)
-# These files should be copied in: chunk_index.faiss, chunk_metadata.json, chunks.jsonl
+# Make sure FAISS files are in the right place
+# These files should be copied in: faiss_index.bin, faiss_metadata.pkl, chunks.jsonl
 
 # Make sure scripts are executable
 RUN chmod +x scripts/*.sh 2>/dev/null || true
@@ -70,6 +68,7 @@ ENV ENVIRONMENT=production
 ENV PORT=8080
 ENV CUDA_VISIBLE_DEVICES=0
 ENV VLLM_USE_MODELSCOPE=False
+ENV TOKENIZERS_PARALLELISM=false
 
 # Switch to non-root user
 USER appuser
