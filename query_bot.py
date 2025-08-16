@@ -6,6 +6,7 @@ import asyncio
 import torch
 import faiss
 import numpy as np
+import pickle
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
@@ -19,8 +20,10 @@ import threading
 
 load_dotenv()
 
-INDEX_NAME = "tutor-bot-index"
-CHUNK_FILE = "chunks.jsonl"
+# File paths for FAISS index and chunks
+FAISS_INDEX_PATH = "faiss_index.bin"
+METADATA_PATH = "faiss_metadata.pkl"
+CHUNK_FILE = "chunks.jsonl"  # Kept for fallback if needed
 
 # Response cache for common questions (saves 30-40% compute)
 response_cache = {}
@@ -86,59 +89,89 @@ def get_embedding_model():
 
 model = get_embedding_model()
 
-def load_faiss_index(index_path="chunk_index.faiss", metadata_path="chunk_metadata.json"):
-    """Load existing FAISS index and metadata"""
+def load_faiss_index(index_path=FAISS_INDEX_PATH, metadata_path=METADATA_PATH):
+    """Load existing FAISS index and metadata from our new format"""
     try:
+        # Load FAISS index
         index = faiss.read_index(index_path)
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        print(f"Loaded FAISS index with {index.ntotal} vectors")
-        return index, metadata
+        
+        # Load metadata and texts from pickle
+        with open(metadata_path, 'rb') as f:
+            data = pickle.load(f)
+            metadata = data['metadata']
+            texts = data.get('texts', [])
+            stats = data.get('stats', {})
+            
+        print(f"✅ Loaded FAISS index with {index.ntotal} vectors")
+        if stats:
+            print(f"📊 Document types in index: {stats.get('by_doc_type', {})}")
+        
+        return index, metadata, texts
+    except FileNotFoundError:
+        print(f"⚠️ FAISS index files not found at {index_path}")
+        print(f"Please run: python embed_chunks_faiss.py")
+        return None, [], []
     except Exception as e:
-        print(f"Error loading FAISS index: {e}")
-        return None, []
+        print(f"❌ Error loading FAISS index: {e}")
+        return None, [], []
 
 class FAISSVectorStore:
     def __init__(self, embedding_dim=384):
-        self.index = faiss.IndexFlatIP(embedding_dim)
+        self.index = None
         self.metadata = []
+        self.texts = []
+        self.embedding_dim = embedding_dim
 
-    def add_vectors(self, vectors, metadata):
-        vectors = np.array(vectors).astype('float32')
-        faiss.normalize_L2(vectors)
-        self.index.add(vectors)
-        self.metadata.extend(metadata)
+    def initialize_empty(self):
+        """Initialize empty index if no saved index exists"""
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
+        self.metadata = []
+        self.texts = []
+
+    def set_index(self, index, metadata, texts):
+        """Set pre-loaded index and metadata"""
+        self.index = index
+        self.metadata = metadata
+        self.texts = texts
 
     def search(self, query_vector, k=2):
+        """Search the index and return results with metadata and text"""
+        if self.index is None or self.index.ntotal == 0:
+            return []
+            
         query_vector = np.array([query_vector]).astype('float32')
         faiss.normalize_L2(query_vector)
         scores, indices = self.index.search(query_vector, k)
 
         results = []
         for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-            if idx != -1:
-                results.append({
+            if idx != -1 and idx < len(self.metadata):
+                result = {
                     'metadata': self.metadata[idx],
+                    'text': self.texts[idx] if idx < len(self.texts) else '',
                     'score': float(score)
-                })
+                }
+                results.append(result)
         return results
 
 # Initialize FAISS store
-try:
-    loaded_index, loaded_metadata = load_faiss_index()
-    if loaded_index is not None:
-        faiss_store = FAISSVectorStore()
-        faiss_store.index = loaded_index
-        faiss_store.metadata = loaded_metadata
-        print("Successfully loaded existing FAISS index")
-    else:
-        faiss_store = FAISSVectorStore()
-        print("Created new empty FAISS index")
-except:
-    faiss_store = FAISSVectorStore()
-    print("Created new empty FAISS index")
+faiss_store = FAISSVectorStore()
 
-# Smart Question Classification functions (keeping these as-is)
+# Load existing index or create empty one
+try:
+    loaded_index, loaded_metadata, loaded_texts = load_faiss_index()
+    if loaded_index is not None:
+        faiss_store.set_index(loaded_index, loaded_metadata, loaded_texts)
+        print(f"✅ Successfully initialized FAISS with {len(loaded_metadata)} chunks")
+    else:
+        print("⚠️ No FAISS index found. Initializing empty store.")
+        print("Run 'python embed_chunks_faiss.py' to create the index.")
+        faiss_store.initialize_empty()
+except Exception as e:
+    print(f"❌ Error initializing FAISS: {e}")
+    faiss_store.initialize_empty()
+
+# Smart Question Classification functions
 def classify_question_type(question: str) -> str:
     """Classify question to determine RAG strategy"""
     question_lower = question.lower().strip()
@@ -224,38 +257,41 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List, List]:
         return retrieve_relevant_chunks(question, k=2)
 
 def retrieve_relevant_chunks(query, k=2):
-    """Retrieves the top k most relevant chunks from FAISS"""
+    """Retrieves the top k most relevant chunks from FAISS with text included"""
     try:
+        # Generate query embedding
         query_embedding = model.encode([query])[0]
+        
+        # Search FAISS index
         results = faiss_store.search(query_embedding, k)
-        chunks = [result['metadata'] for result in results]
-        scores = [result['score'] for result in results]
+        
+        # Extract chunks and scores
+        chunks = []
+        scores = []
+        
+        for result in results:
+            # Create chunk with text included
+            chunk = {
+                'source': result['metadata'].get('source', 'unknown'),
+                'chunk_id': result['metadata'].get('chunk_id', 0),
+                'doc_type': result['metadata'].get('doc_type', 'general'),
+                'text': result['text']  # Text is already included
+            }
+            chunks.append(chunk)
+            scores.append(result['score'])
+        
         return chunks, scores
     except Exception as e:
         print(f"Error retrieving chunks: {e}")
         return [], []
 
-def load_text_for_chunks(chunks, chunk_file_path):
-    """Load the text associated with the chunks"""
+def load_text_for_chunks(chunks, chunk_file_path=None):
+    """Extract text from chunks - text is already included in chunks"""
     if not chunks:
         return []
-
-    texts_by_source = {}
-    try:
-        with open(chunk_file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                key = (obj["source"], obj["chunk_id"])
-                texts_by_source[key] = obj["text"]
-
-        return [texts_by_source[(c["source"], c["chunk_id"])]
-                for c in chunks if (c["source"], c["chunk_id"]) in texts_by_source]
-    except FileNotFoundError:
-        print(f"Warning: {chunk_file_path} not found. Using empty context.")
-        return []
-    except Exception as e:
-        print(f"Error loading chunk texts: {e}")
-        return []
+    
+    # Text is already in the chunks from retrieve_relevant_chunks
+    return [chunk.get('text', '') for chunk in chunks if 'text' in chunk]
 
 class AsyncLlamaService:
     """Async service using vLLM's AsyncLLMEngine with Triton compilation fix"""
@@ -486,12 +522,12 @@ async def ask_question_stream(
     combined_context = ""
     if should_use_rag(question, question_type, has_custom_prompt):
         top_chunks, scores = get_adaptive_chunks(question, question_type)
-        context_passages = load_text_for_chunks(top_chunks, CHUNK_FILE)
+        context_passages = load_text_for_chunks(top_chunks)
         
         if scores and len(scores) > 0:
             relevant_passages = []
             for i, score in enumerate(scores):
-                if score > 0.3:
+                if score > 0.3:  # Relevance threshold
                     if i < len(context_passages):
                         relevant_passages.append(context_passages[i])
             
@@ -590,6 +626,10 @@ def get_queue_status():
         "capacity_percentage": (request_queue.active_requests / request_queue.max_concurrent) * 100
     }
 
-print("🚀 Async query system with request queuing loaded!")
-print("📊 Model: Llama 3.2-3B | Max concurrent: 15 | Queue size: 50")
-print("🎯 Features: Smart RAG, Response Caching, Request Queuing, Triton Fix")
+print("🚀 Async query system with FAISS loaded!")
+print("📊 Model: Llama 3.2-3B | Max concurrent: 25 | Queue size: 75")
+print("🎯 Features: FAISS RAG, Response Caching, Request Queuing, Triton Fix")
+if faiss_store.index and faiss_store.index.ntotal > 0:
+    print(f"✅ FAISS index loaded with {faiss_store.index.ntotal} vectors")
+else:
+    print("⚠️  No FAISS index loaded - RAG disabled. Run: python embed_chunks_faiss.py")
