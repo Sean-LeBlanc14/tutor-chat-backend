@@ -33,24 +33,36 @@ CACHE_TTL = 3600  # 1 hour
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# OCR guidance (applies to all non-overridden system prompts)
+OCR_GUIDANCE = """
+Paraphrase facts from the materials in clean, grammatical English. Do not copy sentences that look corrupted or poorly formatted.
+
+IMPORTANT: The following text may contain OCR errors. Please:
+1. Reconstruct any obviously truncated words (e.g., "proved spatial" → "Improved spatial")
+2. Fix missing spaces between concatenated words
+3. Ensure all numbered lists are complete and properly formatted
+4. If you encounter corrupted text, use context to determine the intended meaning
+5. Maintain the original information while correcting formatting errors
+"""
+
 # Request queue for managing high load
 class RequestQueue:
     """Priority queue for managing requests when at capacity"""
-    def __init__(self, max_concurrent=15, max_queue_size=100):
+    def __init__(self, max_concurrent=25, max_queue_size=75):
         self.max_concurrent = max_concurrent
         self.max_queue_size = max_queue_size
         self.active_requests = 0
         self.queue = deque()
         self.lock = asyncio.Lock()
         self.not_full = asyncio.Condition(self.lock)
-        
+
     async def acquire(self, priority=0):
         """Acquire a slot for processing"""
         async with self.lock:
             # If queue is full, reject request
             if self.active_requests >= self.max_concurrent and len(self.queue) >= self.max_queue_size:
                 raise Exception("Server at capacity. Please try again later.")
-            
+
             # Wait if at concurrent limit
             while self.active_requests >= self.max_concurrent:
                 future = asyncio.Future()
@@ -58,24 +70,24 @@ class RequestQueue:
                 await self.not_full.wait()
                 if future.done():
                     break
-            
+
             self.active_requests += 1
             logger.info(f"Request acquired. Active: {self.active_requests}/{self.max_concurrent}, Queue: {len(self.queue)}")
-    
+
     async def release(self):
         """Release a slot after processing"""
         async with self.lock:
             self.active_requests -= 1
-            
+
             # Process next in queue if any
             if self.queue:
                 _, _, future = self.queue.popleft()
                 future.set_result(True)
-            
+
             self.not_full.notify()
             logger.info(f"Request released. Active: {self.active_requests}/{self.max_concurrent}")
 
-# Global request queue - increase concurrent limit since we have GPU headroom
+# Global request queue - already increased concurrent limit since we have GPU headroom
 request_queue = RequestQueue(max_concurrent=25, max_queue_size=75)
 
 # Load sentence-transformer embedding model (optimized)
@@ -94,18 +106,18 @@ def load_faiss_index(index_path=FAISS_INDEX_PATH, metadata_path=METADATA_PATH):
     try:
         # Load FAISS index
         index = faiss.read_index(index_path)
-        
+
         # Load metadata and texts from pickle
         with open(metadata_path, 'rb') as f:
             data = pickle.load(f)
             metadata = data['metadata']
             texts = data.get('texts', [])
             stats = data.get('stats', {})
-            
+
         print(f"✅ Loaded FAISS index with {index.ntotal} vectors")
         if stats:
             print(f"📊 Document types in index: {stats.get('by_doc_type', {})}")
-        
+
         return index, metadata, texts
     except FileNotFoundError:
         print(f"⚠️ FAISS index files not found at {index_path}")
@@ -138,7 +150,7 @@ class FAISSVectorStore:
         """Search the index and return results with metadata and text"""
         if self.index is None or self.index.ntotal == 0:
             return []
-            
+
         query_vector = np.array([query_vector]).astype('float32')
         faiss.normalize_L2(query_vector)
         scores, indices = self.index.search(query_vector, k)
@@ -261,14 +273,14 @@ def retrieve_relevant_chunks(query, k=2):
     try:
         # Generate query embedding
         query_embedding = model.encode([query])[0]
-        
+
         # Search FAISS index
         results = faiss_store.search(query_embedding, k)
-        
+
         # Extract chunks and scores
         chunks = []
         scores = []
-        
+
         for result in results:
             # Create chunk with text included
             chunk = {
@@ -279,7 +291,7 @@ def retrieve_relevant_chunks(query, k=2):
             }
             chunks.append(chunk)
             scores.append(result['score'])
-        
+
         return chunks, scores
     except Exception as e:
         print(f"Error retrieving chunks: {e}")
@@ -289,41 +301,41 @@ def load_text_for_chunks(chunks, chunk_file_path=None):
     """Extract text from chunks - text is already included in chunks"""
     if not chunks:
         return []
-    
+
     # Text is already in the chunks from retrieve_relevant_chunks
     return [chunk.get('text', '') for chunk in chunks if 'text' in chunk]
 
 class AsyncLlamaService:
     """Async service using vLLM's AsyncLLMEngine with Triton compilation fix"""
-    
+
     def __init__(self):
         self.engine = None
         self.engine_args = None
         self.initialization_lock = asyncio.Lock()
         self.is_initialized = False
         self.warmup_done = False
-        
+
     async def initialize(self):
         """Initialize the async engine with proper warmup to prevent Triton issues"""
         async with self.initialization_lock:
             if self.is_initialized:
                 return
-                
+
             logger.info("🚀 Initializing AsyncLLMEngine with Triton compilation fix...")
-            
+
             # Set environment variables for Triton
             os.environ["TRITON_CACHE_DIR"] = "/tmp/.triton"
             os.environ["CUDA_CACHE_PATH"] = "/tmp/.cuda_cache"
             os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"  # V100 architecture
-            
+
             try:
                 self.engine_args = AsyncEngineArgs(
-                    model="meta-llama/Llama-3.2-3B-Instruct",
+                    model="meta-llama/Llama-3.1-8B-Instruct",
                     dtype="float16",
-                    gpu_memory_utilization=0.80,  # Increased since we have headroom
-                    max_model_len=2048,
-                    max_num_seqs=30,  # Increased to match queue capacity
-                    max_num_batched_tokens=8192,  # Increased for better batching
+                    gpu_memory_utilization=0.88,  # Increased since we have headroom
+                    max_model_len=4096,
+                    max_num_seqs=32,  # Increased to match queue capacity
+                    max_num_batched_tokens=12288,  # Increased for better batching
                     enable_prefix_caching=False,
                     enable_chunked_prefill=False,
                     trust_remote_code=True,
@@ -331,43 +343,43 @@ class AsyncLlamaService:
                     disable_log_stats=False,
                     enforce_eager=True,  # Keep for stability
                 )
-                
+
                 self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
                 self.is_initialized = True
                 logger.info("✅ AsyncLLMEngine initialized successfully!")
-                
+
                 # Perform warmup to compile kernels
                 await self._warmup()
-                
+
             except Exception as e:
                 logger.error(f"Failed to initialize AsyncLLMEngine: {e}")
                 raise
-    
+
     async def _warmup(self):
         """Warmup the model to pre-compile Triton kernels"""
         if self.warmup_done:
             return
-            
+
         logger.info("🔥 Warming up model to compile Triton kernels...")
-        
+
         warmup_prompts = [
             "Hello, how are you?",
             "Explain the concept of perception.",
             "What is the difference between sensation and perception?",
         ]
-        
+
         sampling_params = SamplingParams(
             temperature=0.1,
             max_tokens=50,
             stop=["<|eot_id|>"],
         )
-        
+
         try:
             # Run warmup requests sequentially to avoid compilation conflicts
             for i, prompt in enumerate(warmup_prompts):
                 logger.info(f"Warmup {i+1}/{len(warmup_prompts)}...")
                 request_id = f"warmup_{i}"
-                
+
                 # Format prompt properly
                 formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -376,30 +388,30 @@ You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
 {prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-                
+
                 # Generate and consume the output
                 async for _ in self.engine.generate(formatted_prompt, sampling_params, request_id):
                     pass
-                
+
                 # Small delay between warmup requests
                 await asyncio.sleep(0.1)
-            
+
             self.warmup_done = True
             logger.info("✅ Model warmup complete! Triton kernels compiled.")
-            
+
         except Exception as e:
             logger.error(f"Warmup failed: {e}")
             # Continue anyway - warmup is not critical
             self.warmup_done = True
-    
+
     async def generate_stream(self, prompt: str, temperature: float = 0.7) -> AsyncIterator[str]:
         """Async streaming generation with request queuing"""
         if not self.is_initialized:
             await self.initialize()
-        
+
         # Acquire a slot from the request queue
         await request_queue.acquire()
-        
+
         try:
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -408,14 +420,14 @@ You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
                 repetition_penalty=1.1,
                 top_p=0.95,
             )
-            
+
             # Generate unique request ID
             request_id = f"req_{time.time()}_{hash(prompt)}"
-            
+
             # Generate and stream tokens
             full_response = ""
             results_generator = self.engine.generate(prompt, sampling_params, request_id)
-            
+
             async for request_output in results_generator:
                 if request_output.outputs and len(request_output.outputs) > 0:
                     text = request_output.outputs[0].text
@@ -423,12 +435,12 @@ You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
                     if new_content:
                         full_response = text
                         yield new_content
-                    
+
                     # Check if generation is complete
                     if request_output.finished:
                         logger.info(f"Request {request_id[:20]}... completed successfully")
                         break
-                        
+
         except asyncio.CancelledError:
             # Handle client disconnection gracefully
             logger.info(f"Request cancelled by client")
@@ -469,9 +481,9 @@ async def ask_question_stream(
     chat_history: List[Dict] = None
 ) -> AsyncIterator[str]:
     """True async streaming with request queuing"""
-    
+
     logger.info(f"Processing question: {question[:50]}...")
-    
+
     # Check cache for common questions
     cache_key = get_cache_key(question, system_prompt)
     if cache_key in response_cache:
@@ -484,17 +496,17 @@ async def ask_question_stream(
             for word in words:
                 yield word + " "
             return
-    
+
     # Classify question type
     question_type = classify_question_type(question)
-    
+
     # Default to empty history if none provided
     if chat_history is None:
         chat_history = []
-    
+
     # Check if we have a custom system prompt (sandbox mode)
-    has_custom_prompt = system_prompt and system_prompt.strip()
-    
+    has_custom_prompt = bool(system_prompt and system_prompt.strip())
+
     # Handle different question types (casual, test questions)
     if question_type == "casual" and not has_custom_prompt:
         simple_responses = {
@@ -503,38 +515,39 @@ async def ask_question_stream(
             "thanks": "You're welcome! Feel free to ask any psychology-related questions.",
             "bye": "Goodbye! Good luck with your psychology studies!"
         }
-        
+
         for greeting, response in simple_responses.items():
             if greeting in question.lower():
                 words = response.split()
                 for word in words:
                     yield word + " "
                 return
-    
+
     elif question_type == "test_question" and not has_custom_prompt:
         response = "I can help you understand concepts and provide explanations, but I can't give direct answers to test questions. Instead, let me help you understand the underlying concepts. What specific topic would you like me to explain?"
         words = response.split()
         for word in words:
             yield word + " "
         return
-    
+
     # For academic questions, use smart RAG
     combined_context = ""
     if should_use_rag(question, question_type, has_custom_prompt):
         top_chunks, scores = get_adaptive_chunks(question, question_type)
         context_passages = load_text_for_chunks(top_chunks)
-        
+
         if scores and len(scores) > 0:
             relevant_passages = []
             for i, score in enumerate(scores):
                 if score > 0.3:  # Relevance threshold
                     if i < len(context_passages):
                         relevant_passages.append(context_passages[i])
-            
+
             combined_context = "\n\n".join(relevant_passages) if relevant_passages else ""
-    
+
     # Build prompt
     if has_custom_prompt:
+        # Do NOT add OCR_GUIDANCE here (overridden system prompts)
         if combined_context:
             prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -555,11 +568,13 @@ Additional context:
 
 """
     else:
+        # Default system prompts SHOULD include OCR guidance
         if combined_context:
             prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 You are a helpful psychology tutor. Answer the student's question using the provided course materials when relevant. Keep your response clear, educational, and engaging.
 
+{OCR_GUIDANCE}
 Course Materials:
 {combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -569,18 +584,20 @@ Course Materials:
         else:
             prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are a helpful psychology tutor assistant. Answer the student's question clearly and educationally.<|eot_id|><|start_header_id|>user<|end_header_id|>
+You are a helpful psychology tutor assistant. Answer the student's question clearly and educationally.
+
+{OCR_GUIDANCE}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 {question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-    
+
     # Generate response using async streaming with queuing
     response_text = ""
     async for token in llama_service.generate_stream(prompt, temperature):
         response_text += token
         yield token
-    
+
     # Cache common academic questions
     if not has_custom_prompt and is_cacheable_question(question, question_type):
         response_cache[cache_key] = {
@@ -633,3 +650,4 @@ if faiss_store.index and faiss_store.index.ntotal > 0:
     print(f"✅ FAISS index loaded with {faiss_store.index.ntotal} vectors")
 else:
     print("⚠️  No FAISS index loaded - RAG disabled. Run: python embed_chunks_faiss.py")
+
