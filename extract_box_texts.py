@@ -12,6 +12,7 @@ import pandas as pd
 from docx import Document
 from pptx import Presentation
 from tqdm import tqdm
+from tools.spell_format import SpellFormatter
 
 # ---------------- Config ----------------
 INPUT_DIR    = r"Dr.Mishra-materials"
@@ -140,6 +141,7 @@ class Cleaner:
         return t.strip()
 
 CLEANER = Cleaner()
+SPELLFMT = SpellFormatter(domain_terms_path="resources/domain_terms.txt")
 
 # ---------------- Extractors ----------------
 def pdf_extract(path: str):
@@ -424,7 +426,10 @@ def main():
         text = CLEANER.clean(text)
         text = apply_corrections(text, corr.get("rules", {}))
 
-        # Detect new ligature issues (clean only)
+        # Spell + format pass (conservative; respects domain allow-list)
+        text = SPELLFMT.clean(text)
+
+        # Detect new ligature issues (clean only -> pending)
         for bad, fix, idx in detect_broken_ligatures(text):
             snippet = text[max(0, idx-40): idx+40]
             add_pending(pend, bad, fix, base, snippet)
