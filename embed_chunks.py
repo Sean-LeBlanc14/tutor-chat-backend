@@ -1,6 +1,7 @@
-""" 
+"""
 Enhanced embedding module for FAISS vector database
 Converts chunks to embeddings and creates searchable FAISS index
+(Normalized vectors => cosine similarity with IndexFlatL2)
 """
 import json
 import os
@@ -17,13 +18,15 @@ CHUNK_FILE = "chunks.jsonl"                    # Input chunks
 FAISS_INDEX_PATH = "faiss_index.bin"          # FAISS index file
 METADATA_PATH = "faiss_metadata.pkl"          # Metadata storage
 MODEL_NAME = "all-MiniLM-L6-v2"               # Same model you were using
-BATCH_SIZE = 100                              # Process in batches
-EMBEDDING_DIM = 384                           # Dimension for MiniLM model
+BATCH_SIZE = 100                               # Process in batches
 
 # Alternative models (if you want to experiment):
 # "all-mpnet-base-v2" - dimension: 768, better quality but slower
 # "all-MiniLM-L12-v2" - dimension: 384, slightly better than L6
 # "BAAI/bge-small-en-v1.5" - dimension: 384, good balance
+
+INDEX_TYPE = "Flat"       # "Flat" | "IVF" | "HNSW"
+USE_L2_NORMALIZATION = True  # normalize embeddings & queries (cosine with L2 index)
 
 class FAISSIndexer:
     """Create and manage FAISS index for academic content"""
@@ -36,8 +39,8 @@ class FAISSIndexer:
         print(f"✅ Model loaded (embedding dimension: {self.embedding_dim})")
         
         # Storage for metadata
-        self.metadata = []
-        self.texts = []
+        self.metadata: List[Dict] = []
+        self.texts: List[str] = []
         self.index = None
         
         # Statistics
@@ -51,17 +54,20 @@ class FAISSIndexer:
         """Load chunks from JSONL file"""
         print(f"\n📂 Loading chunks from {chunk_file}...")
         
-        texts = []
-        metadatas = []
+        texts: List[str] = []
+        metadatas: List[Dict] = []
         
         with open(chunk_file, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
                 try:
                     obj = json.loads(line)
                     
                     # Extract text
                     text = obj.get("text", "")
-                    if not text.strip():
+                    if not text or not str(text).strip():
                         continue
                     
                     # Build metadata (including new fields from enhanced chunking)
@@ -102,27 +108,32 @@ class FAISSIndexer:
         """Create embeddings for all texts"""
         print(f"\n🔄 Generating embeddings (batch size: {batch_size})...")
         
-        all_embeddings = []
+        all_embeddings: List[np.ndarray] = []
         
         for i in tqdm(range(0, len(texts), batch_size), desc="Embedding batches"):
             batch_texts = texts[i:i + batch_size]
-            
             # Generate embeddings for batch
             batch_embeddings = self.model.encode(
                 batch_texts,
                 convert_to_numpy=True,
                 show_progress_bar=False  # We're using tqdm already
             )
-            
+            # Ensure float32 & contiguous for FAISS
+            batch_embeddings = np.ascontiguousarray(batch_embeddings.astype('float32'))
             all_embeddings.append(batch_embeddings)
         
         # Combine all embeddings
         embeddings = np.vstack(all_embeddings).astype('float32')
-        print(f"✅ Generated {embeddings.shape[0]} embeddings of dimension {embeddings.shape[1]}")
         
+        # Optional: L2-normalize so FlatL2 == cosine similarity
+        if USE_L2_NORMALIZATION:
+            faiss.normalize_L2(embeddings)
+            print("🧭 Applied L2 normalization to embeddings (cosine similarity mode).")
+        
+        print(f"✅ Generated {embeddings.shape[0]} embeddings of dimension {embeddings.shape[1]}")
         return embeddings
     
-    def create_faiss_index(self, embeddings: np.ndarray, index_type: str = "Flat") -> faiss.Index:
+    def create_faiss_index(self, embeddings: np.ndarray, index_type: str = INDEX_TYPE) -> faiss.Index:
         """
         Create FAISS index from embeddings
         
@@ -141,7 +152,7 @@ class FAISSIndexer:
             
         elif index_type == "IVF":
             # Inverted file index - good for larger datasets
-            nlist = min(100, n_vectors // 10)  # Number of clusters
+            nlist = max(10, min(100, n_vectors // 10))  # Number of clusters
             quantizer = faiss.IndexFlatL2(dim)
             index = faiss.IndexIVFFlat(quantizer, dim, nlist)
             print(f"  Training IVF index with {nlist} clusters...")
@@ -177,6 +188,8 @@ class FAISSIndexer:
             'stats': self.stats,
             'embedding_dim': self.embedding_dim,
             'model_name': MODEL_NAME,
+            'index_type': INDEX_TYPE,
+            'use_l2_normalization': USE_L2_NORMALIZATION,
             'created_at': datetime.now().isoformat()
         }
         
@@ -191,13 +204,23 @@ class FAISSIndexer:
         print(f"  Index size: {os.path.getsize(FAISS_INDEX_PATH) / 1024 / 1024:.2f} MB")
         print(f"  Metadata size: {os.path.getsize(METADATA_PATH) / 1024 / 1024:.2f} MB")
     
+    def _encode_query(self, query: str) -> np.ndarray:
+        """Encode and (optionally) normalize a single query to shape (1, dim)"""
+        qe = self.model.encode([query], convert_to_numpy=True)
+        if qe.ndim == 1:
+            qe = qe[np.newaxis, :]
+        qe = np.ascontiguousarray(qe.astype('float32'))
+        if USE_L2_NORMALIZATION:
+            faiss.normalize_L2(qe)
+        return qe
+
     def test_search(self, index: faiss.Index, texts: List[str], metadata: List[Dict], 
                    query: str = "mental rotation experiment", k: int = 5):
         """Test the index with a sample search"""
         print(f"\n🔍 Testing search with query: '{query}'")
         
         # Encode query
-        query_embedding = self.model.encode([query], convert_to_numpy=True).astype('float32')
+        query_embedding = self._encode_query(query)
         
         # Search
         distances, indices = index.search(query_embedding, k)
@@ -230,9 +253,7 @@ class FAISSIndexer:
         embeddings = self.create_embeddings(texts)
         
         # Create FAISS index
-        # For ~3000 chunks, Flat index is perfect (exact search)
-        # For >10k chunks, consider IVF or HNSW
-        index = self.create_faiss_index(embeddings, index_type="Flat")
+        index = self.create_faiss_index(embeddings, index_type=INDEX_TYPE)
         
         # Save everything
         self.save_index(index, metadata, texts)
@@ -251,20 +272,20 @@ class FAISSIndexer:
         print("import pickle")
         print("from sentence_transformers import SentenceTransformer")
         print("")
-        print("# Load index and metadata")
         print(f"index = faiss.read_index('{FAISS_INDEX_PATH}')")
         print(f"with open('{METADATA_PATH}', 'rb') as f:")
         print("    data = pickle.load(f)")
         print("    metadata = data['metadata']")
         print("    texts = data['texts']")
         print("")
-        print("# Load model for query encoding")
         print(f"model = SentenceTransformer('{MODEL_NAME}')")
-        print("")
-        print("# Search")
-        print("query = 'your search query'")
-        print("query_embedding = model.encode([query], convert_to_numpy=True)")
-        print("distances, indices = index.search(query_embedding, k=5)")
+        print("def encode_query(q):")
+        print("    v = model.encode([q], convert_to_numpy=True).astype('float32')")
+        print("    import numpy as np")
+        print("    if v.ndim == 1: v = v[np.newaxis, :]")
+        print("    faiss.normalize_L2(v)  # because corpus was normalized")
+        print("    return v")
+        print("distances, indices = index.search(encode_query('your search query'), k=5)")
         print("```")
 
 
@@ -299,10 +320,12 @@ def main():
     
     for query in test_queries:
         print(f"\n📍 Query: '{query}'")
-        query_embedding = indexer.model.encode([query], convert_to_numpy=True).astype('float32')
+        query_embedding = indexer._encode_query(query)
         distances, indices = index.search(query_embedding, k=3)
         
-        for i, (dist, idx) in enumerate(zip(distances[0], indices[0][:1])):  # Just show top 1
+        # Just show top 1
+        top = int(min(1, indices.shape[1]))
+        for i, (dist, idx) in enumerate(zip(distances[0], indices[0][:top])):
             if idx >= 0:
                 meta = metadata[idx]
                 print(f"   → Best match: {meta['source']} (type: {meta['doc_type']}, dist: {dist:.4f})")

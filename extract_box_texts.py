@@ -1,542 +1,475 @@
-""" 
-Fixed text extraction module - accepts all content and handles long paths
-"""
-import os
-import re
-import json
-import hashlib
-from datetime import datetime
+# extract_box_texts.py
+# Extraction + Normalization + Registry update + Metadata logging
+# Supports: pdf, docx, pptx, xlsx/csv, txt, jasp
+
+import os, re, io, json, csv, zipfile, shutil, hashlib
 from collections import defaultdict
-import zipfile
-import tempfile
-from pathlib import Path
-from typing import Dict, Tuple, Optional, List
-import fitz  # PyMuPDF for PDF text extraction
+from typing import Dict, List, Tuple
+from datetime import datetime
+
+import fitz  # PyMuPDF
 import pandas as pd
 from docx import Document
 from pptx import Presentation
-import numpy as np
 from tqdm import tqdm
 
-# Configuration
-INPUT_DIR = r"Dr.Mishra-materials"
-OUTPUT_DIR = r"texts"
-METADATA_DIR = r"metadata"
+# ---------------- Config ----------------
+INPUT_DIR    = r"Dr.Mishra-materials"
+OUTPUT_DIR   = r"texts"
+REGISTRY_DIR = r"registry"
+META_DIR     = r"metadata"
+PER_FILE_MD  = os.path.join(META_DIR, "per_file")
 
-# Create output directories
+CORR_PATH = os.path.join(REGISTRY_DIR, "corrections.json")
+PEND_PATH = os.path.join(REGISTRY_DIR, "pending.json")
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(METADATA_DIR, exist_ok=True)
+os.makedirs(REGISTRY_DIR, exist_ok=True)
+os.makedirs(META_DIR, exist_ok=True)
+os.makedirs(PER_FILE_MD, exist_ok=True)
 
-# File type categories
-UNSUPPORTED_EXTENSIONS = [
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff',
-    '.mp4', '.avi', '.mov', '.mkv', '.webm',
-    '.mp3', '.wav', '.m4a', '.flac', '.ogg'
-]
+UNSUPPORTED = {
+    # Do not parse these as text
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff",
+    ".mp4", ".avi", ".mov", ".mkv", ".webm",
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg",
+    ".zip", ".rar", ".7z",
+}
+HAS_OCRMYPDF = shutil.which("ocrmypdf") is not None
 
-# Track used filenames
-used_names = defaultdict(int)
-
-class TextExtractor:
-    """Main text extraction class with metadata tracking"""
-    
-    def __init__(self, output_dir: str, metadata_dir: str):
-        self.output_dir = output_dir
-        self.metadata_dir = metadata_dir
-        self.extraction_stats = {
-            'total_files': 0,
-            'successful': 0,
-            'failed': 0,
-            'unsupported': 0,
-            'by_type': defaultdict(int)
-        }
-    
-    def clean_extracted_text(self, text: str) -> str:
-        """Clean up common PDF extraction artifacts"""
-        if not text:
-            return ""
-        
-        # Fix common OCR artifacts
-        ocr_fixes = {
-            r'\bA B S T R A C T\b': 'ABSTRACT',
-            r'\bS T R A C T\b': 'ABSTRACT',
-            r'\bI N T R O D U C T I O N\b': 'INTRODUCTION',
-            r'\bM E T H O D S\b': 'METHODS',
-            r'\bR E S U L T S\b': 'RESULTS',
-            r'\bD I S C U S S I O N\b': 'DISCUSSION',
-            r'\bC O N C L U S I O N\b': 'CONCLUSION',
-            r'\bR E F E R E N C E S\b': 'REFERENCES',
-        }
-        
-        for pattern, replacement in ocr_fixes.items():
-            text = re.sub(pattern, replacement, text)
-        
-        # Fix spacing issues from OCR
-        text = re.sub(r'\b([a-z])\s+([a-z])\s+([a-z])\s+([a-z])\b', r'\1\2\3\4', text)
-        text = re.sub(r'\bﬀ\b', 'ff', text)
-        text = re.sub(r'\bﬁ\b', 'fi', text)
-        text = re.sub(r'\bfl\b', 'fl', text)
-        text = re.sub(r'\bﬃ\b', 'ffi', text)
-        
-        # Fix broken words with hyphens
-        text = re.sub(r'([a-z])-\s*\n\s*([a-z])', r'\1\2', text)
-        
-        # Fix multiple spaces and normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-        
-        # Remove standalone single letters at start of lines
-        text = re.sub(r'\n[a-z]\s+', '\n', text)
-        
-        return text.strip()
-    
-    def extract_pdf_improved(self, file_path: str) -> Tuple[str, Dict]:
-        """Improved PDF extraction with metadata"""
-        metadata = {
-            'extraction_method': None,
-            'page_count': 0,
-        }
-        
-        try:
-            doc = fitz.open(file_path)
-            metadata['page_count'] = len(doc)
-            
-            # Try multiple extraction methods
-            extracted_texts = []
-            
-            # Method 1: Standard text extraction
-            standard_text = "\n".join([page.get_text() for page in doc])
-            if standard_text.strip():
-                extracted_texts.append(("standard", standard_text))
-            
-            # Method 2: Block-based extraction (better for columns)
-            block_text = ""
-            for page in doc:
-                blocks = page.get_text("dict")["blocks"]
-                for block in blocks:
-                    if "lines" in block:
-                        for line in block["lines"]:
-                            for span in line["spans"]:
-                                block_text += span["text"] + " "
-                            block_text += "\n"
-                        block_text += "\n"
-            
-            if block_text.strip():
-                extracted_texts.append(("blocks", block_text))
-            
-            # Choose the best extraction (longest with least artifacts)
-            best_text = ""
-            best_score = 0
-            best_method = "none"
-            
-            for method, text in extracted_texts:
-                cleaned = self.clean_extracted_text(text)
-                
-                # Simple scoring based on length
-                score = len(cleaned)
-                
-                # Penalize for obvious OCR problems
-                score -= cleaned.count("S T R A C T") * 100
-                
-                if score > best_score:
-                    best_score = score
-                    best_text = cleaned
-                    best_method = method
-            
-            metadata['extraction_method'] = best_method
-            doc.close()
-            return best_text, metadata
-            
-        except Exception as e:
-            print(f"Error extracting PDF {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_excel(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract text from Excel files with metadata"""
-        metadata = {
-            'sheet_count': 0,
-            'total_rows': 0,
-            'total_columns': 0,
-        }
-        
-        try:
-            # Read all sheets
-            excel_file = pd.ExcelFile(file_path, engine='openpyxl')
-            metadata['sheet_count'] = len(excel_file.sheet_names)
-            
-            text_parts = []
-            
-            for sheet_name in excel_file.sheet_names:
-                df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                
-                # Skip empty sheets
-                if df.empty:
-                    continue
-                
-                metadata['total_rows'] += len(df)
-                metadata['total_columns'] = max(metadata['total_columns'], len(df.columns))
-                
-                # Convert to text with formatting
-                text_parts.append(f"=== Sheet: {sheet_name} ===\n")
-                text_parts.append("Columns: " + ", ".join(str(col) for col in df.columns) + "\n\n")
-                
-                # Convert data to string, handling NaN values
-                df_clean = df.fillna('')
-                text_parts.append(df_clean.to_string(index=False, max_rows=1000))
-                text_parts.append("\n\n")
-            
-            return "\n".join(text_parts), metadata
-            
-        except Exception as e:
-            print(f"Error extracting Excel {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_docx(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract text from Word documents with metadata"""
-        metadata = {'paragraph_count': 0}
-        
-        try:
-            doc = Document(file_path)
-            text_parts = []
-            
-            # Extract paragraphs
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    text_parts.append(para.text)
-                    metadata['paragraph_count'] += 1
-            
-            # Extract tables
-            for table in doc.tables:
-                for row in table.rows:
-                    row_text = '\t'.join(cell.text for cell in row.cells)
-                    text_parts.append(row_text)
-            
-            return self.clean_extracted_text("\n".join(text_parts)), metadata
-            
-        except Exception as e:
-            print(f"Error extracting DOCX {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_csv(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract text from CSV files with metadata"""
-        metadata = {'row_count': 0, 'column_count': 0}
-        
-        try:
-            df = pd.read_csv(file_path)
-            metadata['row_count'] = len(df)
-            metadata['column_count'] = len(df.columns)
-            
-            # Convert to string with proper formatting
-            text = f"Columns: {', '.join(df.columns)}\n\n"
-            text += df.to_string(index=False, max_rows=1000)
-            
-            return text, metadata
-            
-        except Exception as e:
-            print(f"Error extracting CSV {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_pptx(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract text from PowerPoint presentations with metadata"""
-        metadata = {'slide_count': 0}
-        
-        try:
-            prs = Presentation(file_path)
-            metadata['slide_count'] = len(prs.slides)
-            
-            text_parts = []
-            
-            for i, slide in enumerate(prs.slides, 1):
-                text_parts.append(f"\n=== Slide {i} ===\n")
-                
-                # Extract text from shapes
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        text_parts.append(shape.text)
-                
-                # Extract notes
-                if slide.notes_slide and slide.notes_slide.notes_text_frame:
-                    notes = slide.notes_slide.notes_text_frame.text
-                    if notes.strip():
-                        text_parts.append(f"[Notes: {notes}]")
-            
-            return self.clean_extracted_text("\n".join(text_parts)), metadata
-            
-        except Exception as e:
-            print(f"Error extracting PPTX {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_text_file(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract text from plain text files with metadata"""
-        metadata = {'encoding': 'utf-8'}
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
-            return self.clean_extracted_text(text), metadata
-            
-        except Exception as e:
-            print(f"Error extracting text file {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def extract_jasp(self, file_path: str) -> Tuple[str, Dict]:
-        """Extract data from JASP files"""
-        metadata = {'has_data': False, 'has_results': False}
-        
-        try:
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    zip_ref.extractall(tmpdir)
-                    
-                    output_parts = []
-                    
-                    # Extract data.csv if it exists
-                    csv_path = os.path.join(tmpdir, 'data.csv')
-                    if os.path.exists(csv_path):
-                        metadata['has_data'] = True
-                        df = pd.read_csv(csv_path)
-                        output_parts.append("### Data\n" + df.to_string(index=False, max_rows=100))
-                    
-                    # Extract results.json if it exists
-                    results_path = os.path.join(tmpdir, 'results.json')
-                    if os.path.exists(results_path):
-                        metadata['has_results'] = True
-                        with open(results_path, 'r', encoding='utf-8') as f:
-                            results = json.load(f)
-                        
-                        def walk_results(obj, path=""):
-                            lines = []
-                            if isinstance(obj, dict):
-                                for key, val in obj.items():
-                                    lines.extend(walk_results(val, f"{path}/{key}" if path else key))
-                            elif isinstance(obj, list):
-                                for i, item in enumerate(obj):
-                                    lines.extend(walk_results(item, f"{path}[{i}]"))
-                            else:
-                                if isinstance(obj, (str, int, float)) and str(obj).strip():
-                                    lines.append(f"{path}: {obj}")
-                            return lines
-                        
-                        extracted = walk_results(results)
-                        output_parts.append("### Results Summary\n" + "\n".join(extracted[:100]))
-                    
-                    return "\n\n".join(output_parts), metadata
-                    
-        except Exception as e:
-            print(f"Error extracting JASP {os.path.basename(file_path)}: {e}")
-            return "", metadata
-    
-    def simple_validate(self, text: str, filename: str) -> Tuple[bool, Dict]:
-        """Simple validation - just check if text exists"""
-        metrics = {
-            'char_count': len(text.strip()),
-            'word_count': len(text.split()) if text.strip() else 0
-        }
-        
-        # Accept ANY non-empty text
-        is_valid = len(text.strip()) > 0
-        
-        return is_valid, metrics
-    
-    def safe_file_hash(self, file_path: str) -> str:
-        """Generate file hash with error handling"""
-        try:
-            hasher = hashlib.md5()
-            with open(file_path, 'rb') as f:
-                buf = f.read(65536)
-                while len(buf) > 0:
-                    hasher.update(buf)
-                    buf = f.read(65536)
-            return hasher.hexdigest()
-        except:
-            return "hash_error"
-    
-    def extract_text(self, file_path: str) -> Tuple[str, Dict]:
-        """Main extraction method that routes to appropriate extractor"""
-        ext = os.path.splitext(file_path)[1].lower()
-        filename = os.path.basename(file_path)
-        
-        # Initialize metadata with safe file operations
-        metadata = {
-            'source_file': file_path,
-            'filename': filename,
-            'extension': ext,
-            'extraction_timestamp': datetime.now().isoformat()
-        }
-        
-        # Safely get file size
-        try:
-            metadata['file_size'] = os.path.getsize(file_path)
-            metadata['file_hash'] = self.safe_file_hash(file_path)
-        except:
-            metadata['file_size'] = 0
-            metadata['file_hash'] = "access_error"
-            print(f"⚠️  Cannot access file: {filename} (path too long or file missing)")
-            return "", metadata
-        
-        try:
-            # Route to appropriate extractor
-            if ext == '.pdf':
-                text, extract_meta = self.extract_pdf_improved(file_path)
-            elif ext == '.docx':
-                text, extract_meta = self.extract_docx(file_path)
-            elif ext in ['.xlsx', '.xls']:
-                text, extract_meta = self.extract_excel(file_path)
-            elif ext == '.csv':
-                text, extract_meta = self.extract_csv(file_path)
-            elif ext == '.pptx':
-                text, extract_meta = self.extract_pptx(file_path)
-            elif ext in ['.txt', '.conf', '.py', '.psyexp']:
-                text, extract_meta = self.extract_text_file(file_path)
-            elif ext == '.jasp':
-                text, extract_meta = self.extract_jasp(file_path)
-            else:
-                return "", metadata
-            
-            # Merge extraction metadata
-            metadata.update(extract_meta)
-            
-            return text, metadata
-            
-        except Exception as e:
-            print(f"[Error] Failed to extract {filename}: {e}")
-            metadata['error'] = str(e)
-            return "", metadata
-    
-    def save_extracted_content(self, text: str, metadata: Dict, base_name: str) -> str:
-        """Save extracted text and metadata"""
-        # Clean filename for Windows
-        base_name = re.sub(r'[<>:"/\\|?*]', '_', base_name)
-        base_name = base_name[:100]  # Limit length
-        
-        # Generate unique filename
-        final_name = base_name
-        while os.path.exists(os.path.join(self.output_dir, final_name + ".txt")):
-            used_names[base_name] += 1
-            final_name = f"{base_name}_{used_names[base_name]}"
-        
-        # Save text
-        text_path = os.path.join(self.output_dir, final_name + ".txt")
-        with open(text_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        
-        # Save metadata
-        metadata_path = os.path.join(self.metadata_dir, final_name + "_metadata.json")
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-        
-        return text_path
-    
-    def process_folder(self, input_dir: str):
-        """Process all files in the input directory"""
-        all_files = []
-        
-        # Collect all files
-        for root, _, files in os.walk(input_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                # Skip if path is too long for Windows
-                if len(file_path) > 250:
-                    print(f"⚠️  Skipping (path too long): {file}")
-                    continue
-                all_files.append(file_path)
-        
-        print(f"Found {len(all_files)} files to process")
-        
-        # Process files with progress bar
-        for file_path in tqdm(all_files, desc="Processing files"):
-            ext = os.path.splitext(file_path)[1].lower()
-            filename = os.path.basename(file_path)
-            
-            self.extraction_stats['total_files'] += 1
-            self.extraction_stats['by_type'][ext] += 1
-            
-            # Skip unsupported files silently
-            if ext in UNSUPPORTED_EXTENSIONS:
-                self.extraction_stats['unsupported'] += 1
-                continue
-            
-            # Extract text
-            text, metadata = self.extract_text(file_path)
-            
-            if text.strip():
-                # Simple validation
-                is_valid, validation_metrics = self.simple_validate(text, filename)
-                metadata['validation_metrics'] = validation_metrics
-                
-                if is_valid:
-                    # Save content
-                    base_name = os.path.splitext(filename)[0]
-                    saved_path = self.save_extracted_content(text, metadata, base_name)
-                    
-                    print(f"✅ {filename} -> {os.path.basename(saved_path)} ({len(text)} chars)")
-                    self.extraction_stats['successful'] += 1
-            else:
-                # Only show warning for supported file types that failed
-                if ext not in UNSUPPORTED_EXTENSIONS:
-                    print(f"⚠️  {filename}: Empty extraction")
-                self.extraction_stats['failed'] += 1
-    
-    def print_summary(self):
-        """Print extraction summary statistics"""
-        print("\n" + "="*60)
-        print("📊 EXTRACTION SUMMARY")
-        print("="*60)
-        print(f"Total files processed: {self.extraction_stats['total_files']}")
-        print(f"Successfully extracted: {self.extraction_stats['successful']}")
-        print(f"Failed/Empty: {self.extraction_stats['failed']}")
-        print(f"Unsupported formats: {self.extraction_stats['unsupported']}")
-        
-        if self.extraction_stats['total_files'] > 0:
-            supported_files = self.extraction_stats['total_files'] - self.extraction_stats['unsupported']
-            if supported_files > 0:
-                success_rate = (self.extraction_stats['successful'] / supported_files) * 100
-                print(f"Success rate (excluding unsupported): {success_rate:.1f}%")
-        
-        print("\n📁 Files by type:")
-        for ext, count in sorted(self.extraction_stats['by_type'].items()):
-            status = "✅" if ext not in UNSUPPORTED_EXTENSIONS else "⏭️"
-            print(f"  {status} {ext}: {count} files")
-        
-        # Save summary to file
-        summary_path = os.path.join(self.metadata_dir, "extraction_summary.json")
-        with open(summary_path, "w") as f:
-            json.dump(self.extraction_stats, f, indent=2)
-        print(f"\n💾 Summary saved to: {summary_path}")
-
-
-def main():
-    """Main execution function"""
-    print("🚀 Starting text extraction...")
-    print(f"Input directory: {INPUT_DIR}")
-    print(f"Output directory: {OUTPUT_DIR}")
-    print(f"Metadata directory: {METADATA_DIR}\n")
-    
-    # Check if openpyxl is installed
+# ---------------- Registry IO ----------------
+def _load(path, default):
     try:
-        import openpyxl
-        print("✅ openpyxl is installed\n")
-    except ImportError:
-        print("❌ openpyxl is not installed!")
-        print("Please run: pip install openpyxl\n")
-        return
-    
-    # Initialize extractor
-    extractor = TextExtractor(OUTPUT_DIR, METADATA_DIR)
-    
-    # Process all files
-    extractor.process_folder(INPUT_DIR)
-    
-    # Print summary
-    extractor.print_summary()
-    
-    print("\n✅ Extraction complete!")
-    print("\n📝 Next steps:")
-    print("1. Review extracted texts in:", OUTPUT_DIR)
-    print("2. Check metadata in:", METADATA_DIR)
-    print("3. Run your chunking script")
-    print("4. Create embeddings for FAISS vector store")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
+def _save(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+def load_registry():
+    corr = _load(CORR_PATH, {"version":1, "rules":{}})
+    pend = _load(PEND_PATH, {"version":1, "candidates":{}})
+    return corr, pend
+
+def save_registry(corr, pend):
+    _save(CORR_PATH, corr)
+    _save(PEND_PATH, pend)
+
+# ---------------- Helpers ----------------
+def sanitize_name(s: str) -> str:
+    s = re.sub(r"[^\w\-. ]+", "_", s)
+    return s.strip()[:200] or "file"
+
+def _has_ctrl(s: str) -> bool:
+    for ch in s:
+        o = ord(ch)
+        if (0 <= o < 32 and ch not in ("\t", "\n")) or o == 127:
+            return True
+    return False
+
+def _is_noisy(s: str) -> bool:
+    if not s:
+        return True
+    printable = sum(1 for ch in s if (ch.isprintable() or ch in "\t\n"))
+    return (printable / max(1, len(s))) < 0.85 or _has_ctrl(s)
+
+def suggest_join_fix(bad: str) -> str:
+    return re.sub(r"(\S)\s+(fi|fl|ff|ffi|ffl)\s+(\S)", r"\1\2\3", bad, flags=re.IGNORECASE)
+
+def detect_broken_ligatures(text: str) -> List[Tuple[str,str,int]]:
+    out = []
+    pat = re.compile(r"\b([A-Za-z]{1,24})\s+(fi|fl|ff|ffi|ffl)\s+([A-Za-z]{1,24})\b")
+    for m in pat.finditer(text):
+        bad = m.group(0)
+        if _is_noisy(bad):
+            continue
+        fix = suggest_join_fix(bad)
+        if bad != fix and not _is_noisy(fix):
+            out.append((bad, fix, m.start()))
+    return out
+
+def apply_corrections(text: str, rules: Dict[str, Dict]) -> str:
+    items = sorted(rules.items(), key=lambda kv: len(kv[0]), reverse=True)
+    for key, spec in items:
+        rep = spec.get("replacement")
+        if spec.get("status") != "approved" or rep is None:
+            continue
+        if spec.get("regex"):
+            try:
+                text = re.sub(key, rep, text)
+            except re.error:
+                text = text.replace(key, rep)
+        else:
+            text = text.replace(key, rep)
+    return text
+
+def add_pending(pend: Dict, key: str, replacement: str, source_name: str, sample: str):
+    if _is_noisy(key) or _is_noisy(replacement) or _is_noisy(sample):
+        return  # skip garbage
+    cand = pend["candidates"].get(key)
+    if not cand:
+        pend["candidates"][key] = {
+            "status": "pending",
+            "replacement": replacement,
+            "total_count": 1,
+            "sources": {source_name: 1},
+            "samples": [sample[:200]]
+        }
+    else:
+        cand["total_count"] += 1
+        cand["sources"][source_name] = cand["sources"].get(source_name, 0) + 1
+        if len(cand["samples"]) < 5 and sample[:200] not in cand["samples"]:
+            cand["samples"].append(sample[:200])
+
+# ---------------- Cleaner ----------------
+class Cleaner:
+    def clean(self, text: str) -> str:
+        import unicodedata
+        t = text or ""
+        t = unicodedata.normalize("NFKC", t)
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        t = t.replace("\u00A0", " ").replace("\u00AD", "")
+        t = re.sub(r"([A-Za-z])-\n([A-Za-z])", r"\1\2", t)  # join hyphenated
+        t = re.sub(r"\n{3,}", "\n\n", t)                   # collapse blank lines
+        t = "\n".join(line.rstrip() for line in t.split("\n"))
+        return t.strip()
+
+CLEANER = Cleaner()
+
+# ---------------- Extractors ----------------
+def pdf_extract(path: str):
+    md = {"type":"pdf"}
+    def needs_ocr(p):
+        try:
+            with fitz.open(p) as d:
+                for pg in d:
+                    if pg.get_text("text").strip():
+                        return False
+            return True
+        except Exception:
+            return True
+    used_ocr = False
+    ocr_tool = None
+    if needs_ocr(path) and HAS_OCRMYPDF:
+        try:
+            out_pdf = path[:-4] + ".ocr.pdf"
+            os.system(f'ocrmypdf --skip-text --deskew "{path}" "{out_pdf}"')
+            path = out_pdf
+            used_ocr = True
+            ocr_tool = "ocrmypdf"
+        except Exception:
+            pass
+
+    try:
+        doc = fitz.open(path)
+        md["page_count"] = len(doc)
+        lines_all = []
+        for pg in doc:
+            blocks = pg.get_text("dict")["blocks"]
+            blocks.sort(key=lambda b: (b.get("bbox", [0,0,0,0])[1], b.get("bbox", [0,0,0,0])[0]))
+            for b in blocks:
+                if "lines" not in b: 
+                    continue
+                for ln in b["lines"]:
+                    buf=[]
+                    for sp in ln.get("spans", []):
+                        s = sp.get("text") or ""
+                        if not s: continue
+                        s = s.replace("\u00AD","").replace("\u00A0"," ")
+                        if buf and buf[-1] and buf[-1][-1].isalnum() and s and s[0].isalnum():
+                            buf.append(" ")
+                        buf.append(s)
+                    txt = "".join(buf).rstrip()
+                    if txt:
+                        lines_all.append(txt)
+                lines_all.append("")  # paragraph break
+        doc.close()
+        text = CLEANER.clean("\n".join(lines_all))
+        md["extraction"] = "blocks"
+        if used_ocr: md["ocr_tool"] = ocr_tool
+        return text, md
+    except Exception as e:
+        md["error"] = f"pdf: {e}"
+        return "", md
+
+def docx_extract(path: str):
+    md = {"type":"docx", "paras":0, "tables":0}
+    try:
+        doc = Document(path)
+        parts=[]
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text); md["paras"]+=1
+        for tb in doc.tables:
+            md["tables"]+=1
+            for row in tb.rows:
+                parts.append("\t".join(c.text for c in row.cells))
+        return CLEANER.clean("\n".join(parts)), md
+    except Exception as e:
+        md["error"] = f"docx: {e}"
+        return "", md
+
+def pptx_extract(path: str):
+    md = {"type":"pptx", "slides":0}
+    try:
+        prs = Presentation(path)
+        parts=[]
+        for s in prs.slides:
+            md["slides"]+=1
+            for shp in s.shapes:
+                if hasattr(shp, "text") and shp.text:
+                    parts.append(shp.text)
+            parts.append("")
+        return CLEANER.clean("\n".join(parts)), md
+    except Exception as e:
+        md["error"] = f"pptx: {e}"
+        return "", md
+
+def xlsx_extract(path: str):
+    md = {"type":"xlsx", "sheets":0}
+    try:
+        xl = pd.ExcelFile(path, engine="openpyxl")
+        parts=[]
+        for name in xl.sheet_names:
+            df = pd.read_excel(xl, sheet_name=name, dtype=str).fillna("")
+            if df.empty: 
+                continue
+            md["sheets"]+=1
+            parts.append(f"=== Sheet: {name} ===")
+            parts.append(",".join(map(str, df.columns)))
+            parts.append(df.to_csv(index=False).strip())
+        return CLEANER.clean("\n".join(parts)), md
+    except Exception as e:
+        md["error"] = f"xlsx: {e}"
+        return "", md
+
+def csv_extract(path: str):
+    md = {"type":"csv"}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return CLEANER.clean(f.read()), md
+    except Exception as e:
+        md["error"] = f"csv: {e}"
+        return "", md
+
+def txt_like_extract(path: str):
+    md = {"type":"text"}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return CLEANER.clean(f.read()), md
+    except Exception as e:
+        md["error"] = f"text: {e}"
+        return "", md
+
+# -------- JASP extractor --------
+def _read_zip_text(zf: zipfile.ZipFile, name: str) -> str:
+    raw = zf.read(name)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", "ignore")
+
+def summarize_jasp_json(obj, max_lines=300):
+    lines=[]
+    def walk(o):
+        if len(lines) >= max_lines:
+            return
+        if isinstance(o, dict):
+            # Print interesting scalar fields on one line
+            interesting = ["title","name","test","statistic","t","F","p","df","df1","df2","N","mean","sd","se","ci","value","estimate","effect","method","dependent","independent","model"]
+            parts=[]
+            for k in interesting:
+                if k in o:
+                    v=o[k]
+                    if isinstance(v, (str,int,float,bool)) and v not in ("", None):
+                        parts.append(f"{k}={v}")
+            if parts:
+                lines.append("  - " + ", ".join(parts))
+            # Simple table printer if present
+            if "columns" in o and "rows" in o and isinstance(o["columns"], list) and isinstance(o["rows"], list):
+                cols=[str(c.get("name") or c.get("title") or c.get("key") or idx) for idx,c in enumerate(o["columns"])]
+                lines.append("TABLE: " + " | ".join(cols))
+                for r in o["rows"][:10]:
+                    if isinstance(r, dict):
+                        row=[str(r.get(c,"")) for c in cols]
+                    elif isinstance(r, list):
+                        row=[str(x) for x in r]
+                    else:
+                        row=[str(r)]
+                    lines.append("  " + " | ".join(row))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for it in o[:50]:
+                walk(it)
+    walk(obj)
+    if not lines:
+        s=json.dumps(obj, ensure_ascii=False)[:1500]
+        return [s]
+    return lines[:max_lines]
+
+def jasp_extract(path: str):
+    """
+    JASP (.jasp) is a ZIP container. We:
+    - list files
+    - emit embedded CSV/TSV (header + sample rows)
+    - summarize embedded JSON objects (analyses/tables)
+    """
+    md = {"type":"jasp", "files":[]}
+    parts=[]
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            md["files"] = names
+
+            # Pull data tables first
+            for name in names:
+                lower=name.lower()
+                if lower.endswith((".csv",".tsv",".txt")):
+                    try:
+                        txt = _read_zip_text(z, name)
+                    except Exception:
+                        continue
+                    txt = CLEANER.clean(txt)
+                    # leave header plus first ~200 lines to avoid bloat
+                    lines = txt.splitlines()
+                    sample = "\n".join(lines[:201])
+                    parts.append(f"=== JASP Embedded Data: {name} ===")
+                    parts.append(sample)
+                    parts.append("")
+
+            # Summarize JSON analyses
+            for name in names:
+                if name.lower().endswith(".json"):
+                    try:
+                        jtxt = _read_zip_text(z, name)
+                        jobj = json.loads(jtxt)
+                    except Exception:
+                        continue
+                    parts.append(f"=== JASP JSON: {name} (summary) ===")
+                    parts.extend(summarize_jasp_json(jobj))
+                    parts.append("")
+
+        if not parts:
+            parts.append("[No readable text sections found in .jasp archive]")
+        text = CLEANER.clean("\n".join(parts))
+        return text, md
+
+    except Exception as e:
+        md["error"] = f"jasp: {e}"
+        return "", md
+
+# ---------------- Main run ----------------
+def main():
+    corr, pend = load_registry()
+
+    stats = {
+        "total":0, "ok":0, "failed":0, "unsupported":0, 
+        "by_ext": defaultdict(int), "by_type": defaultdict(int)
+    }
+
+    file_list=[]
+    for root, _, files in os.walk(INPUT_DIR):
+        for fn in files:
+            file_list.append(os.path.join(root, fn))
+    file_list.sort(key=lambda p: p.lower())
+
+    pbar = tqdm(file_list, desc="Extracting")
+    for path in pbar:
+        stats["total"] += 1
+        base = os.path.basename(path)
+        ext  = os.path.splitext(base)[1].lower()
+        stats["by_ext"][ext] += 1
+
+        if ext in UNSUPPORTED:
+            stats["unsupported"] += 1
+            continue
+
+        # Extract
+        if ext == ".pdf":
+            text, md = pdf_extract(path)
+        elif ext == ".docx":
+            text, md = docx_extract(path)
+        elif ext == ".pptx":
+            text, md = pptx_extract(path)
+        elif ext in (".xlsx", ".xls"):
+            text, md = xlsx_extract(path)
+        elif ext == ".csv":
+            text, md = csv_extract(path)
+        elif ext == ".jasp":
+            text, md = jasp_extract(path)
+        else:
+            text, md = txt_like_extract(path)
+
+        per_file = {
+            "source_path": path,
+            "filename": base,
+            "extension": ext,
+            "meta": md
+        }
+
+        if not text.strip():
+            stats["failed"] += 1
+            per_file["status"] = "empty_or_failed"
+            with open(os.path.join(PER_FILE_MD, sanitize_name(base) + ".json"), "w", encoding="utf-8") as f:
+                json.dump(per_file, f, indent=2, ensure_ascii=False)
+            continue
+
+        # Normalize + corrections
+        text = CLEANER.clean(text)
+        text = apply_corrections(text, corr.get("rules", {}))
+
+        # Detect new ligature issues (clean only)
+        for bad, fix, idx in detect_broken_ligatures(text):
+            snippet = text[max(0, idx-40): idx+40]
+            add_pending(pend, bad, fix, base, snippet)
+
+        # Save .txt
+        out_name = sanitize_name(os.path.splitext(base)[0]) + ".txt"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        per_file["status"] = "ok"
+        per_file["text_path"] = out_path
+        per_file["char_count"] = len(text)
+        stats["ok"] += 1
+        stats["by_type"][per_file["meta"].get("type","?")] += 1
+
+        with open(os.path.join(PER_FILE_MD, sanitize_name(base) + ".json"), "w", encoding="utf-8") as f:
+            json.dump(per_file, f, indent=2, ensure_ascii=False)
+
+    save_registry(corr, pend)
+
+    # Print summary
+    print("\n" + "="*60)
+    print("📊 EXTRACTION SUMMARY")
+    print("="*60)
+    print(f"Total files: {stats['total']}")
+    print(f"Successfully extracted: {stats['ok']}")
+    print(f"Failed/Empty: {stats['failed']}")
+    print(f"Unsupported formats: {stats['unsupported']}")
+    print("\n📁 Files by type:")
+    for k,v in sorted(stats["by_ext"].items()):
+        print(f"  {'✅' if k not in UNSUPPORTED else '⏭️'} {k or '[noext]'}: {v} files")
+    print("\nDetected content types:")
+    for k,v in sorted(stats["by_type"].items()):
+        print(f"  {k}: {v} files")
+
+    # Save a machine-readable summary too
+    summary = {
+        "timestamp": datetime.utcnow().isoformat()+"Z",
+        "stats": stats
+    }
+    with open(os.path.join(META_DIR, "extraction_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"\n💾 Summary saved to: {os.path.join(META_DIR, 'extraction_summary.json')}")
+    print(f"💾 Pending suggestions: {os.path.join(REGISTRY_DIR, 'pending.json')}")
 
 if __name__ == "__main__":
     main()

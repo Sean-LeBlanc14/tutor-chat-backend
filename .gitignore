@@ -1,9 +1,13 @@
+# -----------------------------
 # Python
+# -----------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Packaging/build
 build/
 develop-eggs/
 dist/
@@ -21,31 +25,27 @@ wheels/
 *.egg
 MANIFEST
 
-# Environment variables - CRITICAL FOR SECURITY
+# Env files (secrets)
 .env
-.env.local
-.env.production
-.env.development
-.env.test
-.env.dev
+.env.*
 *.env
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
-.venv/
 
-# IDE and editors
+# IDE/editors
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS generated files
+# OS files
 .DS_Store
 .DS_Store?
 ._*
@@ -59,7 +59,7 @@ Thumbs.db
 logs/
 app.log
 
-# Database files (if any local ones)
+# DB (local)
 *.db
 *.sqlite
 *.sqlite3
@@ -67,7 +67,7 @@ app.log
 # Docker
 .dockerignore
 
-# Jupyter Notebook
+# Jupyter
 .ipynb_checkpoints
 
 # pytest
@@ -80,37 +80,26 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
-# ML Models (if storing locally)
-models/
-*.bin
-*.safetensors
+# -----------------------------
+# Project-specific artifacts
+# -----------------------------
 
-# Temporary files
-tmp/
-temp/
+# Normalization/word-registry state (runtime, not source)
+registry/
+registry_backups/
+
+# Extracted & normalized text and metadata (regenerable)
+texts/
+metadata/
+extraction_summary.json
+
+# Chunking outputs (regenerable)
 chunks.jsonl
+chunks_*.jsonl
+chunks_backup.jsonl
+*.jsonl
 
-# Production specific
-docker-compose.prod.yml
-nginx.prod.conf
-
-# Secrets and keys
-secrets.txt
-keys.txt
-*.key
-*.pem
-
-# Backup files
-*.bak
-*.backup
-
-Dr.Mishra-Materials
-texts
-start-with-gpu.sh
-metadata
-docker-compose.yml
-
-# FAISS and Vector Store files
+# FAISS + vector-store artifacts (regenerable)
 faiss_index.bin
 faiss_metadata.pkl
 *.faiss
@@ -118,36 +107,45 @@ faiss_metadata.pkl
 vector_store/
 embeddings/
 
-# Data processing artifacts
-chunks.jsonl
-chunks_*.jsonl
-chunks_backup.jsonl
-*.jsonl
-
-# Extracted content (since you can regenerate)
-texts/
-metadata/
-extraction_summary.json
-
-# Large model files
-*.pt
-*.pth
-*.onnx
-*.h5
-*.pb
+# Model and embedding caches
+models/
+*.bin
+*.safetensors
 sentence_transformers_cache/
 .cache/
+hf_cache/
 
-# Pinecone remnants (if any)
+# Source data we don’t want to commit
+Dr.Mishra-Materials/
+
+# Misc project files you listed
+start-with-gpu.sh
+docker-compose.yml
+
+# Pinecone leftovers (if any)
 pinecone_index/
 
-# Test outputs
-test_*.txt
-test_*.json
-*_test.py
-
-# Backup and temporary processing files
+# Temporary files
+tmp/
+temp/
 *.tmp
 *.temp
 *_old.*
 *_backup.*
+
+# Tests outputs
+test_*.txt
+test_*.json
+*_test.py
+
+# -----------------------------
+# Optional (uncomment if desired)
+# Large binaries you might not want in Git
+# -----------------------------
+# *.pdf
+# *.pptx
+# *.docx
+# *.xlsx
+# *.jasp
+# pdf_images/
+# ocr_cache/
