@@ -17,7 +17,7 @@ router = APIRouter()
 
 # Session configuration
 SESSION_EXPIRE_HOURS = 8  # Reduced for security
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-fallback-secret-key")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 VALID_COURSE_CODE = os.getenv("VALID_COURSE_CODE")
 
 # Validate required environment variables

@@ -73,7 +73,7 @@ def sanitize_input(text: str, max_length: int) -> str:
 def hash_token_secure(token: str, salt: str = None) -> str:
     """More secure token hashing with salt"""
     if not salt:
-        salt = os.getenv("JWT_SECRET_KEY", "fallback-salt")
+        salt = os.getenv("JWT_SECRET_KEY")
 
     return hashlib.pbkdf2_hmac(
         'sha256',

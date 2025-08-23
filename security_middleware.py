@@ -7,6 +7,7 @@ import ipaddress
 import os
 from fastapi.responses import JSONResponse
 
+
 class SecurityHeadersMiddleware:
     """Add security headers to all responses"""
 
@@ -31,9 +32,8 @@ class SecurityHeadersMiddleware:
                             b"style-src 'self' 'unsafe-inline'"
                         ),
                         b"referrer-policy": b"strict-origin-when-cross-origin",
-                        b"permissions-policy": b"geolocation=(), microphone=(), camera=()"
+                        b"permissions-policy": b"geolocation=(), microphone=(), camera=()",
                     }
-
 
                     headers.update(security_headers)
                     message["headers"] = list(headers.items())
@@ -43,6 +43,7 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send_wrapper)
         else:
             await self.app(scope, receive, send)
+
 
 class IPWhitelistMiddleware:
     """IP whitelist middleware for admin endpoints"""
@@ -98,6 +99,7 @@ class IPWhitelistMiddleware:
 
         await self.app(scope, receive, send)
 
+
 class RequestSignatureMiddleware:
     """Verify request signatures for API calls"""
 
@@ -105,11 +107,15 @@ class RequestSignatureMiddleware:
         self.app = app
         self.secret_key = secret_key or os.getenv("API_SIGNATURE_SECRET")
         self.require_signature = require_signature
+        # Hard requirement: do not run without a real secret in prod
+        if not self.secret_key:
+            raise RuntimeError("API_SIGNATURE_SECRET is required but not set.")
 
     def verify_signature(self, body: bytes, signature: str, timestamp: str) -> bool:
         """Verify HMAC signature"""
         if not self.secret_key:
-            return not self.require_signature
+            # Should not happen due to constructor guard; fail closed if it does
+            return False
 
         try:
             # Check timestamp (prevent replay attacks)
@@ -166,6 +172,7 @@ class RequestSignatureMiddleware:
 
                 # Recreate receive function with cached body
                 body_sent = False
+
                 async def receive_wrapper():
                     nonlocal body_sent
                     if not body_sent:
@@ -183,13 +190,17 @@ class RequestSignatureMiddleware:
         else:
             await self.app(scope, receive, send)
 
+
 # CSRF Protection
 class CSRFMiddleware:
     """CSRF protection middleware"""
 
     def __init__(self, app, secret_key: str = None):
         self.app = app
-        self.secret_key = secret_key or os.getenv("CSRF_SECRET_KEY", "fallback-csrf-secret")
+        self.secret_key = secret_key or os.getenv("CSRF_SECRET_KEY")
+        # Hard requirement: do not run without a real secret in prod
+        if not self.secret_key:
+            raise RuntimeError("CSRF_SECRET_KEY is required but not set.")
 
     def generate_csrf_token(self, session_id: str) -> str:
         """Generate CSRF token"""
@@ -245,3 +256,4 @@ class CSRFMiddleware:
                 return
 
         await self.app(scope, receive, send)
+

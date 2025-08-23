@@ -149,3 +149,4 @@ test_*.json
 # *.jasp
 # pdf_images/
 # ocr_cache/
+.env.backup*
