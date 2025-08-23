@@ -30,8 +30,6 @@ def validate_environment_variables():
     """Validate required environment variables are set"""
     required_vars = [
         "API_KEY",
-        "PINECONE_API_KEY", 
-        "PINECONE_ENVIRONMENT",
         "DATABASE_URL",
         "JWT_SECRET_KEY",
         "VALID_COURSE_CODE"
