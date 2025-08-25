@@ -197,8 +197,6 @@ def classify_question_type(question: str) -> str:
     return "general"
 
 def should_use_rag(question: str, question_type: str, has_custom_prompt: bool = False) -> bool:
-    if has_custom_prompt:
-        return False
     if question_type in ("casual", "test_question"):
         return False
     if question_type == "academic":
@@ -306,9 +304,9 @@ class AsyncLlamaService:
                 model=self.prod_model_id,
                 dtype="float16",
                 gpu_memory_utilization=0.88,
-                max_model_len=4096,
-                max_num_seqs=32,
-                max_num_batched_tokens=12288,
+                max_model_len=16384,
+                max_num_seqs=4,
+                max_num_batched_tokens=16384,
                 enable_prefix_caching=False,
                 enable_chunked_prefill=False,
                 trust_remote_code=True,
@@ -435,8 +433,12 @@ def build_prompt(system_prompt: Optional[str],
             )
     else:
         sys = (
-            "You are a helpful psychology tutor. Use the provided course materials when relevant. "
-            "Keep your response clear, educational, and engaging."
+            "You are a Socratic-style psychology tutor. Your goal is to help students think critically "
+            "and arrive at answers themselves through guided questioning. Ask probing, open-ended questions "
+            "instead of giving direct answers immediately. Encourage students to explain their reasoning, "
+            "consider alternatives, and make connections to prior knowledge. Provide clarifications or hints "
+            "when they are stuck, and only supply direct explanations or definitions as a last resort. "
+            "Always keep responses clear, concise, and supportive, while maintaining an encouraging tone."
         )
         if combined_context:
             return (
