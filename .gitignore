@@ -150,3 +150,6 @@ test_*.json
 # pdf_images/
 # ocr_cache/
 .env.backup*
+
+pgdata
+hf-cache

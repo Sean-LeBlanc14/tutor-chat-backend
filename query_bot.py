@@ -248,7 +248,9 @@ def load_text_for_chunks(chunks):
     return [c.get('text','') for c in chunks]
 
 # ---------------------------------------------------------------------
-# vLLM async service with streaming
+# vLLM (prod) + Transformers CPU fallback (dev)
+# - PROD uses big model (default: meta-llama/Llama-3.1-8B-Instruct) via vLLM
+# - DEV uses a smaller model via transformers on CPU for fast local boot
 # ---------------------------------------------------------------------
 class AsyncLlamaService:
     def __init__(self):
@@ -258,6 +260,15 @@ class AsyncLlamaService:
         self.is_initialized = False
         self.warmup_done = False
 
+        # dev fallback bits
+        self.dev_fallback = False
+        self.hf_model = None
+        self.hf_tokenizer = None
+
+        # model IDs
+        self.prod_model_id = os.getenv("MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+        self.dev_model_id = os.getenv("DEV_MODEL_ID", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     async def initialize(self):
         async with self.initialization_lock:
             if self.is_initialized:
@@ -266,8 +277,33 @@ class AsyncLlamaService:
             os.environ["TRITON_CACHE_DIR"] = "/tmp/.triton"
             os.environ["CUDA_CACHE_PATH"] = "/tmp/.cuda_cache"
             os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"  # V100
+
+            ENV = os.getenv("ENVIRONMENT", "").lower()
+
+            if ENV == "development":
+                # DEV: smaller CPU model via transformers
+                self.dev_fallback = True
+                try:
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+                except Exception:
+                    logger.error("Transformers not installed; install 'transformers' for dev CPU mode or use GPU.")
+                    raise
+
+                model_id = self.dev_model_id
+                logger.info(f"DEV mode: loading HF model on CPU: {model_id}")
+                self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id)
+                self.hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float32,
+                    device_map="cpu"
+                )
+                self.is_initialized = True
+                return
+
+            # PROD / non-dev: vLLM path (unchanged, big model)
+            self.dev_fallback = False
             self.engine_args = AsyncEngineArgs(
-                model="meta-llama/Llama-3.1-8B-Instruct",
+                model=self.prod_model_id,
                 dtype="float16",
                 gpu_memory_utilization=0.88,
                 max_model_len=4096,
@@ -288,6 +324,38 @@ class AsyncLlamaService:
             await self.initialize()
         await request_queue.acquire()
         try:
+            if self.dev_fallback:
+                # Transformers CPU generation with simple chunked streaming
+                from transformers import StoppingCriteria, StoppingCriteriaList
+
+                class StopOnTokens(StoppingCriteria):
+                    def __call__(self, input_ids, scores, **kwargs):
+                        return False  # rely on max_new_tokens / eos from tokenizer
+
+                stopping_criteria = StoppingCriteriaList([StopOnTokens()])
+                inputs = self.hf_tokenizer(prompt, return_tensors="pt")
+                input_ids = inputs["input_ids"]
+                with torch.no_grad():
+                    output_ids = self.hf_model.generate(
+                        input_ids=input_ids,
+                        max_new_tokens=512,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=0.95,
+                        repetition_penalty=1.1,
+                        stopping_criteria=stopping_criteria,
+                    )[0]
+                full_text = self.hf_tokenizer.decode(
+                    output_ids[input_ids.shape[1]:],
+                    skip_special_tokens=True
+                )
+                # crude chunked streaming to mimic server-sent tokens
+                chunk_size = max(24, len(full_text) // 50)
+                for i in range(0, len(full_text), chunk_size):
+                    yield full_text[i:i + chunk_size]
+                return
+
+            # vLLM path (prod)
             sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=1024,
@@ -298,7 +366,6 @@ class AsyncLlamaService:
             request_id = f"req_{time.time()}_{hash(prompt)}"
             results = self.engine.generate(prompt, sampling_params, request_id)
 
-            # Robust delta: use LCP to handle non-monotonic tail edits
             emitted = ""
 
             def lcp_len(a: str, b: str) -> int:
@@ -310,16 +377,12 @@ class AsyncLlamaService:
 
             async for out in results:
                 if out.outputs and len(out.outputs) > 0:
-                    new_text = out.outputs[0].text  # cumulative text from vLLM
-
-                    # Fast path if it's a clean append
+                    new_text = out.outputs[0].text
                     if new_text.startswith(emitted):
                         delta = new_text[len(emitted):]
                     else:
-                        # Compute longest common prefix to recover any back-edits
                         common = lcp_len(emitted, new_text)
                         delta = new_text[common:]
-
                     if delta:
                         emitted = new_text
                         yield delta
@@ -473,4 +536,3 @@ if faiss_store.index and faiss_store.index.ntotal > 0:
     print(f"✅ FAISS index loaded with {faiss_store.index.ntotal} vectors")
 else:
     print("⚠️  No FAISS index loaded - RAG disabled. Run: python embed_chunks_faiss.py")
-
