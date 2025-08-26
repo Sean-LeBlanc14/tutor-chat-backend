@@ -1,5 +1,6 @@
 # query_bot.py — strict RAG + streaming
 # Handles context retrieval with true async concurrency for classroom scale
+# Dynamic chat-history budgeting to avoid max-context overflows
 
 import json
 import os
@@ -17,6 +18,8 @@ import time
 from typing import List, Dict, Optional, Tuple, AsyncIterator
 import logging
 from collections import deque
+import hashlib
+from transformers import AutoTokenizer  # NEW: tokenizer for token budgeting
 
 load_dotenv()
 
@@ -246,9 +249,84 @@ def load_text_for_chunks(chunks):
     return [c.get('text','') for c in chunks]
 
 # ---------------------------------------------------------------------
-# vLLM (prod) + Transformers CPU fallback (dev)
-# - PROD uses big model (default: meta-llama/Llama-3.1-8B-Instruct) via vLLM
-# - DEV uses a smaller model via transformers on CPU for fast local boot
+# NEW: token & chat-history budgeting helpers
+# ---------------------------------------------------------------------
+def count_tokens(tok, text: str) -> int:
+    if tok is None or not text:
+        # fallback heuristic
+        return max(1, len(text) // 4)
+    return len(tok.encode(text))
+
+def join_blocks(*blocks: str) -> str:
+    return "".join([b for b in blocks if b])
+
+def trim_to_token_budget(tok, text: str, budget: int) -> str:
+    if count_tokens(tok, text) <= budget:
+        return text
+    # binary trim from the left, keep the tail (most recent info)
+    lo, hi = 0, len(text)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = text[-mid:]
+        if count_tokens(tok, cand) <= budget:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+def format_history_budgeted(tok, chat_history: List[Dict], hard_cap_tokens: int, max_turns_soft: int = 8) -> str:
+    """Prioritize most recent messages; keep under hard token cap, soft cap by last N messages."""
+    if not chat_history or hard_cap_tokens <= 0:
+        return ""
+    msgs = chat_history[-max_turns_soft:]
+    pieces_rev = []
+    used = 0
+    for m in reversed(msgs):
+        role = "user" if m.get("role", "user") == "user" else "assistant"
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        block = f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+        t = count_tokens(tok, block)
+        if used + t > hard_cap_tokens:
+            if used == 0:
+                header = f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+                footer = "<|eot_id|>"
+                remaining = max(0, hard_cap_tokens - count_tokens(tok, header) - count_tokens(tok, footer))
+                trimmed_content = trim_to_token_budget(tok, content, remaining)
+                if trimmed_content:
+                    pieces_rev.append(f"{header}{trimmed_content}{footer}")
+                    used = hard_cap_tokens
+            break
+        pieces_rev.append(block)
+        used += t
+    pieces = list(reversed(pieces_rev))
+    return "".join(pieces)
+
+def build_retrieval_query(question: str, chat_history: List[Dict], max_chars: int = 400) -> str:
+    if not chat_history:
+        return question
+    last_user = ""
+    for m in reversed(chat_history):
+        if m.get("role") == "user":
+            last_user = (m.get("content") or "").strip()
+            if last_user:
+                break
+    composed = (last_user + " " + question).strip() if last_user else question
+    return composed[-max_chars:]
+
+def fingerprint_history_for_cache(chat_history: List[Dict], max_turns: int = 8) -> str:
+    try:
+        short = (chat_history or [])[-max_turns:]
+        j = json.dumps(short, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.md5(j.encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return "nohist"
+
+# ---------------------------------------------------------------------
+# vLLM (prod) + Transformers CPU fallback (dev) with tokenizer for budgeting
 # ---------------------------------------------------------------------
 class AsyncLlamaService:
     def __init__(self):
@@ -258,12 +336,12 @@ class AsyncLlamaService:
         self.is_initialized = False
         self.warmup_done = False
 
-        # dev fallback bits
         self.dev_fallback = False
         self.hf_model = None
         self.hf_tokenizer = None
 
-        # model IDs
+        self.prompt_tokenizer = None  # NEW: tokenizer for prompt token counts
+
         self.prod_model_id = os.getenv("MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
         self.dev_model_id = os.getenv("DEV_MODEL_ID", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
@@ -281,16 +359,13 @@ class AsyncLlamaService:
             if ENV == "development":
                 # DEV: smaller CPU model via transformers
                 self.dev_fallback = True
-                try:
-                    from transformers import AutoModelForCausalLM, AutoTokenizer
-                except Exception:
-                    logger.error("Transformers not installed; install 'transformers' for dev CPU mode or use GPU.")
-                    raise
-
+                from transformers import AutoModelForCausalLM, AutoTokenizer as DevTokenizer
                 model_id = self.dev_model_id
                 logger.info(f"DEV mode: loading HF model on CPU: {model_id}")
-                self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id)
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
+                self.hf_tokenizer = DevTokenizer.from_pretrained(model_id)
+                self.prompt_tokenizer = self.hf_tokenizer  # reuse for budgeting
+                from transformers import AutoModelForCausalLM as DevModel
+                self.hf_model = DevModel.from_pretrained(
                     model_id,
                     torch_dtype=torch.float32,
                     device_map="cpu"
@@ -298,13 +373,13 @@ class AsyncLlamaService:
                 self.is_initialized = True
                 return
 
-            # PROD / non-dev: vLLM path (unchanged, big model)
+            # PROD / non-dev: vLLM path
             self.dev_fallback = False
             self.engine_args = AsyncEngineArgs(
                 model=self.prod_model_id,
                 dtype="float16",
                 gpu_memory_utilization=0.88,
-                max_model_len=16384,
+                max_model_len=16384,  # keep as in your original file
                 max_num_seqs=4,
                 max_num_batched_tokens=16384,
                 enable_prefix_caching=False,
@@ -315,6 +390,14 @@ class AsyncLlamaService:
                 enforce_eager=True,
             )
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
+
+            # Load a HF tokenizer for budgeting on CPU
+            try:
+                self.prompt_tokenizer = AutoTokenizer.from_pretrained(self.prod_model_id)
+            except Exception as e:
+                logger.warning(f"Tokenizer load failed for budgeting; falling back to length heuristic: {e}")
+                self.prompt_tokenizer = None
+
             self.is_initialized = True
 
     async def generate_stream(self, prompt: str, temperature: float = 0.7) -> AsyncIterator[str]:
@@ -328,7 +411,7 @@ class AsyncLlamaService:
 
                 class StopOnTokens(StoppingCriteria):
                     def __call__(self, input_ids, scores, **kwargs):
-                        return False  # rely on max_new_tokens / eos from tokenizer
+                        return False
 
                 stopping_criteria = StoppingCriteriaList([StopOnTokens()])
                 inputs = self.hf_tokenizer(prompt, return_tensors="pt")
@@ -347,7 +430,6 @@ class AsyncLlamaService:
                     output_ids[input_ids.shape[1]:],
                     skip_special_tokens=True
                 )
-                # crude chunked streaming to mimic server-sent tokens
                 chunk_size = max(24, len(full_text) // 50)
                 for i in range(0, len(full_text), chunk_size):
                     yield full_text[i:i + chunk_size]
@@ -365,12 +447,9 @@ class AsyncLlamaService:
             results = self.engine.generate(prompt, sampling_params, request_id)
 
             emitted = ""
-
             def lcp_len(a: str, b: str) -> int:
-                m = min(len(a), len(b))
-                i = 0
-                while i < m and a[i] == b[i]:
-                    i += 1
+                m = min(len(a), len(b)); i = 0
+                while i < m and a[i] == b[i]: i += 1
                 return i
 
             async for out in results:
@@ -384,7 +463,6 @@ class AsyncLlamaService:
                     if delta:
                         emitted = new_text
                         yield delta
-
                 if out.finished:
                     logger.info(f"Request {request_id[:20]}... completed successfully")
                     break
@@ -399,8 +477,9 @@ llama_service = AsyncLlamaService()
 response_cache: Dict[str, Dict] = {}
 CACHE_TTL = 3600
 
-def get_cache_key(question: str, system_prompt: str = None) -> str:
-    key_content = f"{question.lower().strip()}_{system_prompt or 'default'}"
+def get_cache_key(question: str, system_prompt: str = None, chat_history: List[Dict] = None) -> str:
+    h = fingerprint_history_for_cache(chat_history or [])
+    key_content = f"{question.lower().strip()}_{(system_prompt or 'default').strip()}_{h}"
     return str(hash(key_content))
 
 def is_cacheable_question(question: str, question_type: str) -> bool:
@@ -410,51 +489,8 @@ def is_cacheable_question(question: str, question_type: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------
-# Public API
+# Public API (dynamic budgeting in ask_question_stream)
 # ---------------------------------------------------------------------
-def build_prompt(system_prompt: Optional[str],
-                 combined_context: str,
-                 question_core: str,
-                 body_noisy: bool) -> str:
-    if system_prompt and system_prompt.strip():
-        if combined_context:
-            return (
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-                f"{system_prompt.strip()}\n\n"
-                "Additional context:\n"
-                f"{combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-                f"{question_core}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            )
-        else:
-            return (
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-                f"{system_prompt.strip()}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-                f"{question_core}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            )
-    else:
-        sys = (
-            "You are a Socratic-style psychology tutor. Your goal is to help students think critically "
-            "and arrive at answers themselves through guided questioning. Ask probing, open-ended questions "
-            "instead of giving direct answers immediately. Encourage students to explain their reasoning, "
-            "consider alternatives, and make connections to prior knowledge. Provide clarifications or hints "
-            "when they are stuck, and only supply direct explanations or definitions as a last resort. "
-            "Always keep responses clear, concise, and supportive, while maintaining an encouraging tone."
-        )
-        if combined_context:
-            return (
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-                f"{sys}\n"
-                "Course Materials:\n"
-                f"{combined_context}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-                f"{question_core}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            )
-        else:
-            return (
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-                f"{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-                f"{question_core}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            )
-
 async def ask_question_stream(
     question: str,
     system_prompt: str = None,
@@ -464,36 +500,102 @@ async def ask_question_stream(
     logger.info(f"Processing question: {question[:80]}...")
     question_core = question.strip()
     question_type = classify_question_type(question_core)
+    if chat_history is None:
+        chat_history = []
 
-    cache_key = get_cache_key(question_core, system_prompt)
+    cache_key = get_cache_key(question_core, system_prompt, chat_history)
     if cache_key in response_cache and (time.time() - response_cache[cache_key]['timestamp'] < CACHE_TTL):
         response = response_cache[cache_key]['response']
         for w in response.split():
             yield w + " "
         return
 
-    if chat_history is None:
-        chat_history = []
-
     has_custom_prompt = bool(system_prompt and system_prompt.strip())
+    retrieval_query = build_retrieval_query(question_core, chat_history)
 
+    # Build raw RAG context; trimming happens after budgeting
     if should_use_rag(question_core, question_type, has_custom_prompt):
-        top_chunks, _scores = get_adaptive_chunks(question_core, question_type)
+        top_chunks, _scores = get_adaptive_chunks(retrieval_query, question_type)
         passages = load_text_for_chunks(top_chunks)
-        MAX_CONTEXT_CHARS = 1800
-        buf, used = [], 0
-        for p in passages:
-            if not p:
-                continue
-            if used + len(p) + 2 > MAX_CONTEXT_CHARS:
-                break
-            buf.append(p)
-            used += len(p) + 2
-        combined_context = "\n\n".join(buf)
+        combined_context_raw = "\n\n".join([p for p in passages if p])
     else:
-        combined_context = ""
+        combined_context_raw = ""
 
-    prompt = build_prompt(system_prompt, combined_context, question_core, False)
+    # ----------- Dynamic token budgeting -----------
+    await llama_service.initialize()
+    tok = llama_service.prompt_tokenizer
+    max_ctx = llama_service.engine_args.max_model_len if llama_service.engine_args else 16384
+
+    RESPONSE_BUDGET = 1024          # tokens reserved for model output
+    PROMPT_SAFETY  = 128            # guard band
+    prompt_budget  = max(512, max_ctx - RESPONSE_BUDGET - PROMPT_SAFETY)
+
+    default_sys = (
+        "You are a step-by-step Socratic psychology tutor. Your goal is to guide students to think critically "
+        "and build their understanding through structured dialogue.\n\n"
+        "Teaching style:\n"
+        "- Always follow this sequence:\n"
+        "  1. Give a short, natural affirmation of the student’s response (e.g., “Nice start!” or “Good point”). Correct gently if needed.\n"
+        "  2. Ask ONE open-ended guiding question that builds directly on their answer. Avoid leading or stacked phrasing.\n"
+        "  3. After they respond, expand or clarify with evidence, examples, or research findings.\n\n"
+        "- Let students attempt their own definitions or reasoning first before refining or adding detail.\n"
+        "- Anchor questions tightly to the same topic or scenario; do not jump to unrelated examples.\n"
+        "- Use concrete, everyday scenarios as scaffolds (e.g., studying for a test, remembering a name, recognizing a face).\n\n"
+        "Handling challenges:\n"
+        "- If the student is vague, off-topic, or says “I don’t know,” follow this rhythm:\n"
+        "  1. Give a short, supportive affirmation (“That’s okay — this can be tricky”).\n"
+        "  2. Provide a small, direct, on-topic hint or example.\n"
+        "  3. Ask one simple follow-up question tied to the hint.\n"
+        "- For lazy answers, do not escalate difficulty too quickly. Start with process-level steps (e.g., encoding vs retrieval) before introducing more advanced ideas (e.g., brain regions).\n"
+        "- Build success quickly by offering strong hints when needed (e.g., “This brain area’s name starts with ‘hippo…’”). Once the student answers, affirm and expand.\n\n"
+        "- If the student tries to derail, acknowledge their input but bring them back to the topic.\n"
+        "- If the student asks about assignments (e.g., lab reports, introductions, research papers), walk them through step by step: purpose/goal → structure → examples → refinements.\n\n"
+        "Tone:\n"
+        "- Keep responses concise, supportive, and encouraging.\n"
+        "- Favor exploration, but ground reasoning in known psychological findings when appropriate."
+    )
+    sys_text = (system_prompt.strip() if has_custom_prompt else default_sys)
+
+    sys_block = (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        f"{sys_text}\n<|eot_id|>"
+    )
+    sys_tokens = count_tokens(tok, sys_block)
+    remaining_for_prompt = max(0, prompt_budget - sys_tokens)
+
+    # Allocate ~70% of remaining prompt to recent chat history
+    hist_budget = int(remaining_for_prompt * 0.7)
+    history_block = format_history_budgeted(tok, chat_history, hist_budget, max_turns_soft=8)
+    history_tokens = count_tokens(tok, history_block)
+
+    # Remaining goes to RAG context (if any)
+    remaining_after_hist = max(0, remaining_for_prompt - history_tokens)
+    if combined_context_raw:
+        ctx_body = "Additional context:\n" + combined_context_raw
+        ctx_block = trim_to_token_budget(tok, ctx_body, remaining_after_hist)
+        ctx_block = f"{ctx_block}<|eot_id|>" if ctx_block else ""
+    else:
+        ctx_block = ""
+
+    user_block = f"<|start_header_id|>user<|end_header_id|>\n\n{question_core}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    prompt = join_blocks(sys_block, ctx_block, history_block, user_block)
+
+    # Final guard: if still oversized, re-trim history then context
+    total_tokens = count_tokens(tok, prompt)
+    if total_tokens > (prompt_budget + PROMPT_SAFETY):
+        over = total_tokens - (prompt_budget + PROMPT_SAFETY)
+        new_hist_budget = max(0, hist_budget - over)
+        history_block = format_history_budgeted(tok, chat_history, new_hist_budget, max_turns_soft=8)
+        spent = count_tokens(tok, sys_block) + count_tokens(tok, history_block) + count_tokens(tok, user_block)
+        ctx_budget2 = max(0, prompt_budget - spent)
+        if combined_context_raw and ctx_budget2 > 0:
+            ctx_body = "Additional context:\n" + combined_context_raw
+            ctx_block = trim_to_token_budget(tok, ctx_body, ctx_budget2)
+            ctx_block = f"{ctx_block}<|eot_id|>" if ctx_block else ""
+        else:
+            ctx_block = ""
+        prompt = join_blocks(sys_block, ctx_block, history_block, user_block)
+    # ----------- End dynamic budgeting -----------
 
     response_text = ""
     async for token in llama_service.generate_stream(prompt, temperature):
@@ -538,3 +640,4 @@ if faiss_store.index and faiss_store.index.ntotal > 0:
     print(f"✅ FAISS index loaded with {faiss_store.index.ntotal} vectors")
 else:
     print("⚠️  No FAISS index loaded - RAG disabled. Run: python embed_chunks_faiss.py")
+
