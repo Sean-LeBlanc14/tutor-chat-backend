@@ -553,6 +553,7 @@ async def ask_question_stream(
         "Tone:\n"
         "- Keep responses concise, supportive, and encouraging.\n"
         "- Favor exploration, but ground reasoning in known psychological findings when appropriate."
+        "- If there is no context provided, or the question is not related to the course, kindly redirect the student back to the course."
     )
     sys_text = (system_prompt.strip() if has_custom_prompt else default_sys)
 
