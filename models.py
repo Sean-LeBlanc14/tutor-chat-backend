@@ -50,8 +50,6 @@ class LoginRequest(BaseModel):
 class QuestionRequest(BaseModel):
     """ Enhanced question request with optional chat context """
     question: str = Field(..., min_length=1, max_length=5000, description="User's question")
-    system_prompt: Optional[str] = Field(
-        None, max_length=2000, description="Optional custom prompt")
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0, description="AI temperature")
     chat_id: Optional[str] = Field(None, description="Optional chat ID for context")
 
@@ -77,7 +75,7 @@ class EnvironmentCreate(BaseModel):
     """ Defines data to create an environment """
     name: str = Field(..., min_length=1, max_length=50)
     description: Optional[str] = Field(None, max_length=500)
-    system_prompt: str = Field(..., min_length=1, max_length=2000)
+    system_prompt: str = Field(..., min_length=1, max_length=20000)
     ai_config: Optional[Dict[str, Any]] = Field(default={"temperature": 0.7})
 
     @field_validator('name', 'description')
