@@ -71,7 +71,7 @@ async def create_environment(
 
 @router.delete("/sandbox/environments/{environment_id}")
 async def delete_environment(
-    environment_id: str,
+    environment_id: int,
     current_user = Depends(get_current_user)
 ):
     """Delete a sandbox environment (admin only, creator only)"""
@@ -85,7 +85,7 @@ async def delete_environment(
             FROM sandbox_environments e
             LEFT JOIN users u ON e.created_by = u.id
             WHERE e.id = $1
-        """, int(environment_id))
+        """, (environment_id))
 
         if not env_exists:
             raise HTTPException(status_code=404, detail="Environment not found")
@@ -125,6 +125,8 @@ async def get_sessions(
         # Convert environment_id to int
         env_id = int(environment_id)
 
+        print(f"DEBUG: Looking for sessions with environment_id={env_id}, user_id={current_user['id']}")
+
         # Get sessions for this environment and user
         sessions = await db_manager.execute_query("""
             SELECT s.*,
@@ -139,6 +141,10 @@ async def get_sessions(
             WHERE s.environment_id = $1 AND s.user_id = $2
             ORDER BY s.created_at DESC
         """, env_id, current_user['id'])
+
+        print(f"DEBUG: Found {len(sessions)} sessions")
+        for session in sessions:
+            print(f"  Session {session['id']}: env_id={session['environment_id']}, name={session['session_name']}")
 
         # Get messages for each session
         session_ids = [s['id'] for s in sessions]
@@ -413,13 +419,7 @@ async def sandbox_chat_stream(
         if not session_data:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Save user message first
-        await db_manager.execute_command("""
-            INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
-            VALUES ($1, $2, $3, 'user', $4, 'sandbox')
-        """, str(session_id), session_id, current_user['id'], message.content)
-
-        # Get chat history for this session
+        # FIXED: Get chat history BEFORE saving the new user message
         chat_history = await db_manager.execute_query("""
             SELECT role, content
             FROM chat_logs
@@ -427,6 +427,12 @@ async def sandbox_chat_stream(
             ORDER BY created_at ASC
             LIMIT 20
         """, session_id)
+
+        # Save user message AFTER getting history
+        await db_manager.execute_command("""
+            INSERT INTO chat_logs (chat_id, sandbox_session_id, user_id, role, content, mode)
+            VALUES ($1, $2, $3, 'user', $4, 'sandbox')
+        """, str(session_id), session_id, current_user['id'], message.content)
 
         chat_history_list = [
             {"role": msg["role"], "content": msg["content"]}
@@ -464,7 +470,7 @@ async def sandbox_chat_stream(
 
         return StreamingResponse(
             generate_stream(),
-            media_type="text/plain",
+            media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",

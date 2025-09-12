@@ -219,17 +219,106 @@ def retrieve_relevant_chunks(query, k=2):
         logger.error(f"Error retrieving chunks: {e}")
         return []
 
+def enhance_lab_query(query: str) -> str:
+    """
+    Enhance lab queries with semantic keywords to improve retrieval.
+    Based on actual course structure discovered during testing.
+    """
+    q_lower = query.lower()
+    
+    # Short Labs enhancement
+    if any(term in q_lower for term in ['lab 1', 'lab1', 'first lab', 'short lab 1']):
+        # Lab 1 is about Signal Detection Theory
+        return query + " signal detection theory SDT thresholds perception decisions"
+    
+    elif any(term in q_lower for term in ['lab 0', 'lab0', 'short lab 0']):
+        # Lab 0 is about Method of Limits
+        return query + " method of limits thresholds psychophysics"
+    
+    elif any(term in q_lower for term in ['lab 3', 'lab3', 'third lab', 'short lab 3']):
+        # Lab 3 is about Visual Angle
+        return query + " visual angle perception size distance"
+    
+    # Long Labs enhancement
+    elif any(term in q_lower for term in ['ll1', 'long lab 1', 'visual search']):
+        return query + " visual search attention targets distractors"
+    
+    elif any(term in q_lower for term in ['ll2', 'long lab 2']):
+        return query + " visual attention selective sustained divided"
+    
+    elif any(term in q_lower for term in ['ll3', 'long lab 3']):
+        return query + " final exam preparation review"
+    
+    # General lab queries - add context
+    elif 'lab' in q_lower or 'assignment' in q_lower:
+        return query + " experiment report methods results"
+    
+    return query
+
+def retrieve_relevant_chunks_enhanced(query, k=2):
+    """
+    Enhanced retrieval that detects lab/assignment queries and improves them.
+    This wraps the existing retrieve_relevant_chunks function.
+    """
+    q_lower = query.lower()
+    
+    # Detect if this is a lab/assignment query
+    is_lab_query = any(term in q_lower for term in [
+        'lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3', 
+        'short lab', 'long lab', 'what is', 'tell me about', 'help with'
+    ])
+    
+    if is_lab_query:
+        # Enhance the query with semantic keywords
+        enhanced_query = enhance_lab_query(query)
+        # Increase k to get more relevant chunks
+        k = max(k, 6)
+        logger.info(f"Lab query detected. Enhanced: '{query}' -> '{enhanced_query}', k={k}")
+    else:
+        enhanced_query = query
+    
+    # Use the existing retrieval function
+    try:
+        vec = model.encode([enhanced_query])[0]
+        results = faiss_store.search(vec, k)
+        
+        # Optional: Re-rank results if it's a lab query to prioritize lab-specific sources
+        if is_lab_query and results:
+            # Boost scores for chunks from lab-related files
+            for result in results:
+                source = result.get('metadata', {}).get('source', '').lower()
+                # Boost lab-specific files
+                if any(indicator in source for indicator in ['lab', 'introduction', 'sdt', 'signal']):
+                    result['score'] *= 0.9  # Lower score is better in your system
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error retrieving chunks: {e}")
+        return []
+
 def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List[Dict], List[float]]:
-    if question_type == "academic":
-        if any(w in question.lower() for w in ['compare','contrast','difference','relationship']):
+    """
+    Enhanced adaptive chunk retrieval with better lab/assignment support.
+    """
+    q_lower = question.lower()
+    
+    # Check if this is a lab/assignment query first
+    if any(term in q_lower for term in ['lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3']):
+        # Use enhanced retrieval for lab queries
+        k = 6  # More chunks for lab queries
+        results = retrieve_relevant_chunks_enhanced(question, k=k)
+    elif question_type == "academic":
+        if any(w in q_lower for w in ['compare','contrast','difference','relationship']):
             k = 4
-        elif any(w in question.lower() for w in ['explain','describe','how']):
+        elif any(w in q_lower for w in ['explain','describe','how']):
             k = 3
         else:
             k = 2
+        results = retrieve_relevant_chunks_enhanced(question, k=k)
     else:
         k = 2
-    results = retrieve_relevant_chunks(question, k=k)
+        results = retrieve_relevant_chunks(question, k=k)
+    
     chunks = []
     scores = []
     for r in results:
@@ -241,6 +330,13 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List[Dict], 
             'text': r.get('text', '')
         })
         scores.append(r.get('score', 0.0))
+    
+    # Log what we're retrieving for lab queries (helpful for debugging)
+    if any(term in q_lower for term in ['lab', 'assignment']):
+        logger.info(f"Retrieved {len(chunks)} chunks for lab query: '{question}'")
+        for i, chunk in enumerate(chunks[:3]):  # Log first 3
+            logger.info(f"  {i+1}. {chunk['source']} (score: {scores[i]:.4f})")
+    
     return chunks, scores
 
 def load_text_for_chunks(chunks):
@@ -553,7 +649,7 @@ async def ask_question_stream(
         "Tone:\n"
         "- Keep responses concise, supportive, and encouraging.\n"
         "- Favor exploration, but ground reasoning in known psychological findings when appropriate."
-        "- If there is no context provided, or the question is not related to the course, kindly redirect the student back to the course."
+        "- If there is no context provided, or the question is not related to the course, kindly tell them you can't answer unrelated questions."
     )
     sys_text = (system_prompt.strip() if has_custom_prompt else default_sys)
 
