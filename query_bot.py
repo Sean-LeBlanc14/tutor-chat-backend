@@ -79,7 +79,7 @@ request_queue = RequestQueue(max_concurrent=25, max_queue_size=75)
 @lru_cache(maxsize=1)
 def get_embedding_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    model = SentenceTransformer('multi-qa-mpnet-base-dot-v1', device=device)
     model.eval()
     return model
 
@@ -112,7 +112,7 @@ def load_faiss_index(index_path=FAISS_INDEX_PATH, metadata_path=METADATA_PATH):
 # Vector store abstraction
 # ---------------------------------------------------------------------
 class FAISSVectorStore:
-    def __init__(self, embedding_dim=384):
+    def __init__(self, embedding_dim=768):
         self.index = None
         self.metadata = []
         self.texts = []
@@ -127,22 +127,37 @@ class FAISSVectorStore:
         self.index = index
         self.metadata = metadata
         self.texts = texts
-
+   
     def search(self, query_vector, k=2):
         if self.index is None or self.index.ntotal == 0:
             return []
         q = np.array([query_vector]).astype('float32')
-        faiss.normalize_L2(q)
-        scores, indices = self.index.search(q, k)
+        faiss.normalize_L2(q)  # keep this since you normalized at index build
+        distances, indices = self.index.search(q, k)
+
         results = []
-        for score, idx in zip(scores[0], indices[0]):
+        for dist, idx in zip(distances[0], indices[0]):
             if idx != -1 and idx < len(self.metadata):
                 results.append({
                     'metadata': self.metadata[idx],
                     'text': self.texts[idx] if idx < len(self.texts) else '',
-                    'score': float(score)
+                    'distance': float(dist),       # raw FAISS distance (smaller = better)
+                    'score': -float(dist)          # invert so higher = better
                 })
+
+        # sort by score descending (so closest vectors come first)
+        results.sort(key=lambda r: r['score'], reverse=True)
         return results
+
+    def get_specific_chunk(self, chunk_id: int):
+        """Get a specific chunk by its index"""
+        if chunk_id < len(self.texts) and chunk_id < len(self.metadata):
+            return {
+                'metadata': self.metadata[chunk_id],
+                'text': self.texts[chunk_id],
+                'score': 0.0  # Perfect score since we're directly accessing
+            }
+        return None
 
 faiss_store = FAISSVectorStore()
 try:
@@ -162,6 +177,24 @@ except Exception as e:
 # ---------------------------------------------------------------------
 def classify_question_type(question: str) -> str:
     q = question.lower().strip()
+
+    # Administrative patterns - CHECK FIRST for priority
+    admin_patterns = [
+        r'\b(office hours?|OH)\b',
+        r'\b(due date|deadline|when is.*due|submit)\b',
+        r'\b(assignment|homework)\b',
+        r'\b(syllabus|schedule|calendar)\b',
+        r'\b(professor|prof|dr\.|instructor|TA)\b',
+        r'\b(grade|grading|points|credit)\b',
+        r'\b(where is|location|room|building)\b',
+        r'\bwhen are\b',
+        r'\bemail\b',
+    ]
+
+    for p in admin_patterns:
+        if re.search(p, q):
+            return "administrative"
+
     casual_patterns = [
         r'\b(hi|hello|hey|thanks|thank you|goodbye|bye)\b',
         r'how are you',
@@ -180,7 +213,7 @@ def classify_question_type(question: str) -> str:
         r'example of'
     ]
     test_patterns = [
-        r'\b(test|quiz|exam|assessment|homework|assignment)\b',
+        r'\b(test|quiz|exam|assessment)\b',
         r'correct answer',
         r'multiple choice',
         r'true or false',
@@ -202,12 +235,13 @@ def classify_question_type(question: str) -> str:
 def should_use_rag(question: str, question_type: str, has_custom_prompt: bool = False) -> bool:
     if question_type in ("casual", "test_question"):
         return False
-    if question_type == "academic":
+    if question_type in ("academic", "administrative"):  # Added administrative
         return True
     if question_type == "general":
         return any(k in question.lower() for k in
                    ['perception','sensation','visual','auditory','attention',
-                    'memory','learning','brain','neural','cognitive','psychology'])
+                    'memory','learning','brain','neural','cognitive','psychology',
+                    'office','hours','due','syllabus','assignment'])  # Added admin keywords
     return False
 
 def retrieve_relevant_chunks(query, k=2):
@@ -222,37 +256,51 @@ def retrieve_relevant_chunks(query, k=2):
 def enhance_lab_query(query: str) -> str:
     """
     Enhance lab queries with semantic keywords to improve retrieval.
-    Based on actual course structure discovered during testing.
+    Based on actual course structure.
     """
     q_lower = query.lower()
-    
+
+    if 'office hour' in q_lower or ('office' in q_lower and 'hour' in q_lower):
+        # Add terms that appear near office hours in syllabi
+        return query + " instructor Dr. Mishra drop-in DDH appointment zoom schedule when available meet CRN 82109 Fall 2025"
+
     # Short Labs enhancement
-    if any(term in q_lower for term in ['lab 1', 'lab1', 'first lab', 'short lab 1']):
-        # Lab 1 is about Signal Detection Theory
-        return query + " signal detection theory SDT thresholds perception decisions"
-    
-    elif any(term in q_lower for term in ['lab 0', 'lab0', 'short lab 0']):
-        # Lab 0 is about Method of Limits
-        return query + " method of limits thresholds psychophysics"
-    
-    elif any(term in q_lower for term in ['lab 3', 'lab3', 'third lab', 'short lab 3']):
-        # Lab 3 is about Visual Angle
-        return query + " visual angle perception size distance"
-    
+    if any(term in q_lower for term in ['short lab 0', 'sl0', 'lab report 1', 'practice lab']):
+        return query + " method of limits threshold psychophysics practice"
+
+    elif any(term in q_lower for term in ['short lab 1', 'sl1', 'lab report 2']):
+        return query + " method of constant stimuli psychophysics perception"
+
+    elif any(term in q_lower for term in ['short lab 2', 'sl2', 'lab report 3']):
+        return query + " signal detection theory SDT sensitivity d-prime beta"
+
+    elif any(term in q_lower for term in ['short lab 3', 'sl3', 'lab report 4']):
+        return query + " visual angle size perception distance retinal image"
+
     # Long Labs enhancement
-    elif any(term in q_lower for term in ['ll1', 'long lab 1', 'visual search']):
-        return query + " visual search attention targets distractors"
-    
-    elif any(term in q_lower for term in ['ll2', 'long lab 2']):
-        return query + " visual attention selective sustained divided"
-    
-    elif any(term in q_lower for term in ['ll3', 'long lab 3']):
-        return query + " final exam preparation review"
-    
-    # General lab queries - add context
-    elif 'lab' in q_lower or 'assignment' in q_lower:
-        return query + " experiment report methods results"
-    
+    elif any(term in q_lower for term in ['long lab 0', 'll0', 'lab report 5', 'practice long']):
+        return query + " mental rotation spatial cognition imagery Shepard Metzler"
+
+    elif any(term in q_lower for term in ['long lab 1', 'll1', 'lab report 6']):
+        return query + " visual attention selective attention focused attention"
+
+    elif any(term in q_lower for term in ['long lab 2', 'll2', 'lab report 7']):
+        return query + " visual search feature conjunction attention Treisman"
+
+    elif any(term in q_lower for term in ['final lab', 'lab report 8', 'final report']):
+        return query + " face recognition facial perception prosopagnosia fusiform"
+
+    # General lab queries
+    elif 'lab' in q_lower or 'assignment' in q_lower or 'report' in q_lower:
+        return query + " experiment report methods results discussion"
+
+    # Administrative enhancements (office hours, etc.)
+    elif any(term in q_lower for term in ['office hours', 'office hour', 'oh']):
+        return query + " instructor professor meeting available schedule contact"
+
+    elif 'mishra' in q_lower or 'professor' in q_lower:
+        return query + " Dr. Mishra instructor professor contact office hours"
+
     return query
 
 def retrieve_relevant_chunks_enhanced(query, k=2):
@@ -261,13 +309,13 @@ def retrieve_relevant_chunks_enhanced(query, k=2):
     This wraps the existing retrieve_relevant_chunks function.
     """
     q_lower = query.lower()
-    
+
     # Detect if this is a lab/assignment query
     is_lab_query = any(term in q_lower for term in [
-        'lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3', 
-        'short lab', 'long lab', 'what is', 'tell me about', 'help with'
+        'lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3',
+        'short lab', 'long lab'
     ])
-    
+
     if is_lab_query:
         # Enhance the query with semantic keywords
         enhanced_query = enhance_lab_query(query)
@@ -276,21 +324,21 @@ def retrieve_relevant_chunks_enhanced(query, k=2):
         logger.info(f"Lab query detected. Enhanced: '{query}' -> '{enhanced_query}', k={k}")
     else:
         enhanced_query = query
-    
+
     # Use the existing retrieval function
     try:
         vec = model.encode([enhanced_query])[0]
         results = faiss_store.search(vec, k)
-        
+
         # Optional: Re-rank results if it's a lab query to prioritize lab-specific sources
         if is_lab_query and results:
-            # Boost scores for chunks from lab-related files
-            for result in results:
-                source = result.get('metadata', {}).get('source', '').lower()
-                # Boost lab-specific files
-                if any(indicator in source for indicator in ['lab', 'introduction', 'sdt', 'signal']):
-                    result['score'] *= 0.9  # Lower score is better in your system
-        
+            for r in results:
+                source = r.get('metadata', {}).get('source', '').lower()
+                if any(ind in source for ind in ['lab', 'sdt', 'signal', 'visual angle', 'mental rotation', 'visual search', 'treisman']):
+                    r['score'] *= 1.05  # small boost
+            results.sort(key=lambda r: r['score'], reverse=True)
+
+
         return results
     except Exception as e:
         logger.error(f"Error retrieving chunks: {e}")
@@ -301,12 +349,54 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List[Dict], 
     Enhanced adaptive chunk retrieval with better lab/assignment support.
     """
     q_lower = question.lower()
+
+    # SPECIAL HANDLING FOR OFFICE HOURS AND ADMINISTRATIVE QUESTIONS
+    admin_keywords = ['office hour', 'when', 'where', 'contact', 'email', 
+                      'syllabus', 'due date', 'schedule', 'class time', 'drop-in', 'drop in']
     
-    # Check if this is a lab/assignment query first
-    if any(term in q_lower for term in ['lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3']):
+    if question_type == "administrative" or any(kw in q_lower for kw in admin_keywords):
+        # Get more chunks initially for filtering
+        k = 10
+        results = retrieve_relevant_chunks_enhanced(question, k=k)
+        
+        # Find Fall 2025 syllabus chunks specifically
+        fall_2025_chunks = []
+        other_syllabus_chunks = []
+        other_chunks = []
+        
+        for r in results:
+            source = r.get('metadata', {}).get('source', '')
+            text = r.get('text', '')
+            
+            # Check for Fall 2025 syllabus
+            if 'Syllabus_SPLab_F25' in source:
+                # Check if this is THE chunk with office hours info
+                if any(x in text for x in ['DDH D121', '2:30 to 3:30', 'Drop-In hours', 'CRN: 82109', 
+                                            'OFFICE HOURS FALL 2025', '10:00 am -12:00']):
+                    fall_2025_chunks.insert(0, r)  # Put THE office hours chunk first
+                else:
+                    fall_2025_chunks.append(r)
+            # Skip library/writing center resources for office hours queries
+            elif 'office hour' in q_lower and ('library' in source.lower() or 'writing' in source.lower()):
+                continue
+            # Other syllabus files
+            elif 'syllabus' in source.lower():
+                other_syllabus_chunks.append(r)
+            else:
+                other_chunks.append(r)
+        
+        # Combine with Fall 2025 first, then other syllabi, then others
+        results = (fall_2025_chunks + other_syllabus_chunks + other_chunks)[:6]
+        
+        if 'office hour' in q_lower:
+            logger.info(f"Office hours query - prioritized {len(fall_2025_chunks)} Fall 2025 chunks")
+    
+    # Check if this is a lab/assignment query
+    elif any(term in q_lower for term in ['lab', 'assignment', 'homework', 'll0', 'll1', 'll2', 'll3']):
         # Use enhanced retrieval for lab queries
         k = 6  # More chunks for lab queries
         results = retrieve_relevant_chunks_enhanced(question, k=k)
+    
     elif question_type == "academic":
         if any(w in q_lower for w in ['compare','contrast','difference','relationship']):
             k = 4
@@ -318,7 +408,7 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List[Dict], 
     else:
         k = 2
         results = retrieve_relevant_chunks(question, k=k)
-    
+
     chunks = []
     scores = []
     for r in results:
@@ -330,13 +420,13 @@ def get_adaptive_chunks(question: str, question_type: str) -> Tuple[List[Dict], 
             'text': r.get('text', '')
         })
         scores.append(r.get('score', 0.0))
-    
-    # Log what we're retrieving for lab queries (helpful for debugging)
-    if any(term in q_lower for term in ['lab', 'assignment']):
-        logger.info(f"Retrieved {len(chunks)} chunks for lab query: '{question}'")
+
+    # Log what we're retrieving for debugging
+    if any(term in q_lower for term in ['office', 'lab', 'assignment']):
+        logger.info(f"Retrieved {len(chunks)} chunks for query: '{question}'")
         for i, chunk in enumerate(chunks[:3]):  # Log first 3
             logger.info(f"  {i+1}. {chunk['source']} (score: {scores[i]:.4f})")
-    
+
     return chunks, scores
 
 def load_text_for_chunks(chunks):
@@ -626,31 +716,87 @@ async def ask_question_stream(
     PROMPT_SAFETY  = 128            # guard band
     prompt_budget  = max(512, max_ctx - RESPONSE_BUDGET - PROMPT_SAFETY)
 
+    # Updated unified system prompt with Fall 2025
+    # Updated unified system prompt with Fall 2025 office hours included
     default_sys = (
-        "You are a step-by-step Socratic psychology tutor. Your goal is to guide students to think critically "
-        "and build their understanding through structured dialogue.\n\n"
-        "Teaching style:\n"
-        "- Always follow this sequence:\n"
-        "  1. Give a short, natural affirmation of the student’s response (e.g., “Nice start!” or “Good point”). Correct gently if needed.\n"
-        "  2. Ask ONE open-ended guiding question that builds directly on their answer. Avoid leading or stacked phrasing.\n"
-        "  3. After they respond, expand or clarify with evidence, examples, or research findings.\n\n"
-        "- Let students attempt their own definitions or reasoning first before refining or adding detail.\n"
-        "- Anchor questions tightly to the same topic or scenario; do not jump to unrelated examples.\n"
-        "- Use concrete, everyday scenarios as scaffolds (e.g., studying for a test, remembering a name, recognizing a face).\n\n"
-        "Handling challenges:\n"
-        "- If the student is vague, off-topic, or says “I don’t know,” follow this rhythm:\n"
-        "  1. Give a short, supportive affirmation (“That’s okay — this can be tricky”).\n"
-        "  2. Provide a small, direct, on-topic hint or example.\n"
-        "  3. Ask one simple follow-up question tied to the hint.\n"
-        "- For lazy answers, do not escalate difficulty too quickly. Start with process-level steps (e.g., encoding vs retrieval) before introducing more advanced ideas (e.g., brain regions).\n"
-        "- Build success quickly by offering strong hints when needed (e.g., “This brain area’s name starts with ‘hippo…’”). Once the student answers, affirm and expand.\n\n"
-        "- If the student tries to derail, acknowledge their input but bring them back to the topic.\n"
-        "- If the student asks about assignments (e.g., lab reports, introductions, research papers), walk them through step by step: purpose/goal → structure → examples → refinements.\n\n"
-        "Tone:\n"
-        "- Keep responses concise, supportive, and encouraging.\n"
-        "- Favor exploration, but ground reasoning in known psychological findings when appropriate."
-        "- If there is no context provided, or the question is not related to the course, kindly tell them you can't answer unrelated questions."
+        "You are a Socratic tutor assistant for Dr. Maruti Mishra's Sensation and Perception lab course (PSYC 4220).\n"
+        "Current semester: Fall 2025\n\n"
+
+        "YOUR PRIMARY ROLE: Guide students to discover concepts through questions, not lecture.\n\n"
+
+        "RESPONSE RULES - FOLLOW THIS DECISION TREE:\n"
+        "1. Is this an ADMINISTRATIVE question (dates, points, logistics, 'who is', 'when is', 'how many points', 'what room', 'email')?\n"
+        "   → YES: Give direct, factual answer from context only\n"
+        "   → NO: Continue to step 2\n\n"
+        "2. Is this a CONCEPTUAL question (what is, how does, explain, why does, describe, tell me about)?\n"
+        "   → YES: USE SOCRATIC METHOD (see examples below)\n"
+        "   → Start with a question that activates prior knowledge\n"
+        "   → Guide through discovery with follow-up questions\n"
+        "   → NEVER give definitions or explanations directly\n"
+        "   → Even if you have the information, make them think first\n\n"
+
+        "SOCRATIC RESPONSE EXAMPLES:\n"
+        "Student: 'What is mental rotation?'\n"
+        "WRONG: 'Mental rotation refers to the cognitive process...'\n"
+        "RIGHT: 'Think about playing Tetris - what do you do in your mind when you need to fit a falling piece into a specific spot? Can you describe that mental process?'\n\n"
+        "Student: 'What is signal detection theory?'\n"
+        "WRONG: 'Signal detection theory is a framework...'\n"
+        "RIGHT: 'Imagine you're a radiologist looking at an X-ray for signs of cancer. What are the different possible outcomes when you make a decision about whether you see something suspicious or not?'\n\n"
+        "Student: 'Explain the method of limits'\n"
+        "WRONG: 'The method of limits is a psychophysical procedure...'\n"
+        "RIGHT: 'Have you ever had your hearing tested where they play increasingly quiet tones until you can't hear them anymore? What do you think the tester is trying to find when they do that?'\n\n"
+
+        "SOCRATIC PROGRESSION PATTERN:\n"
+        "1st response: Broad, relatable question to activate thinking\n"
+        "2nd response: More focused question based on their answer\n"
+        "3rd response: Connect to specific course concept\n"
+        "4th response: If still struggling, provide specific hint (but still as a question)\n"
+        "If student says 'just tell me' or expresses frustration: Provide more specific hints but maintain question format\n\n"
+
+        "FALL 2025 COURSE INFORMATION:\n"
+        "- Class: Mon/Wed 1:00-2:15 PM in WS Library Lab 14\n"
+        "- Dr. Mishra's Office Hours (In-person): Mon/Wed 2:30-3:30 PM in DDH D121\n"
+        "- Dr. Mishra's Office Hours (Zoom): Tuesday 10:00 AM-12:00 PM (by appointment, email for link)\n"
+        "- Dr. Mishra's Email: mmishra@csub.edu (include 'PSYC4220-01' in subject line)\n"
+        "- CRN: 82109\n\n"
+
+        "LAB ASSIGNMENTS:\n"
+        "- Short Lab 0: Method of Limits (psychophysics threshold)\n"
+        "- Short Lab 1: Method of Constant Stimuli (psychophysics perception)\n"
+        "- Short Lab 2: Signal Detection Theory (SDT, d′, beta)\n"
+        "- Short Lab 3: Visual Angle & Size Perception\n"
+        "- Long Lab 0: Mental Rotation (Shepard & Metzler)\n"
+        "- Long Lab 1: Visual Attention (selective/focused)\n"
+        "- Long Lab 2: Visual Search (feature & conjunction, Treisman)\n"
+        "- Final Lab: Face Recognition (prosopagnosia, fusiform face area)\n\n"
+
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. NEVER use first-person pronouns (I, my, me, mine) when discussing course information\n"
+        "2. Always refer to the instructor as 'Dr. Mishra' or 'the instructor' - never imply you ARE the instructor\n"
+        "3. You are a tutor assistant, not the professor\n"
+        "4. For administrative questions ONLY: provide information that is EXPLICITLY stated in context\n"
+        "5. For conceptual questions: ALWAYS use Socratic method, even if you have the answer\n"
+        "6. If asked about specific numbers (points, percentages, dates) for assignments, only state what is documented - NEVER guess\n"
+        "7. For follow-up questions, maintain awareness of what was just discussed\n\n"
+
+        "CONTEXT USAGE:\n"
+        "- For ADMINISTRATIVE info: Use provided context to answer questions directly\n"
+        "- For CONCEPTUAL topics: Use context to inform your Socratic questions, but don't lecture from it\n"
+        "- If multiple semesters' information exists in context, prioritize Fall 2025\n"
+        "- If administrative information is not available, say: 'I don't have that specific information in the course materials. You may want to check Canvas or email Dr. Mishra at mmishra@csub.edu'\n\n"
+
+        "CONVERSATION CONTINUITY:\n"
+        "- Track the topic of conversation across multiple exchanges\n"
+        "- If a student asks a follow-up question (e.g., 'What about that?' or 'When is that due?'), refer back to the previously discussed topic\n"
+        "- Remember what concepts you were building toward in previous questions\n\n"
+
+        "REMEMBER:\n"
+        "- Administrative questions → Direct answers\n"
+        "- Conceptual questions → Socratic method ALWAYS\n"
+        "- The goal is student learning through discovery, not just providing answers\n"
+        "- Keep responses concise and focused on one question at a time\n"
     )
+
     sys_text = (system_prompt.strip() if has_custom_prompt else default_sys)
 
     sys_block = (
@@ -660,8 +806,8 @@ async def ask_question_stream(
     sys_tokens = count_tokens(tok, sys_block)
     remaining_for_prompt = max(0, prompt_budget - sys_tokens)
 
-    # Allocate ~70% of remaining prompt to recent chat history
-    hist_budget = int(remaining_for_prompt * 0.7)
+    # Allocate ~40% of remaining prompt to recent chat history (giving more room to context)
+    hist_budget = int(remaining_for_prompt * 0.4)
     history_block = format_history_budgeted(tok, chat_history, hist_budget, max_turns_soft=8)
     history_tokens = count_tokens(tok, history_block)
 
@@ -737,4 +883,3 @@ if faiss_store.index and faiss_store.index.ntotal > 0:
     print(f"✅ FAISS index loaded with {faiss_store.index.ntotal} vectors")
 else:
     print("⚠️  No FAISS index loaded - RAG disabled. Run: python embed_chunks_faiss.py")
-
