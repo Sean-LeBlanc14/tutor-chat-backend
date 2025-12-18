@@ -103,15 +103,9 @@ app = FastAPI(
 
 # Environment configuration
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+FRONTEND_URLS = [url.strip() for url in os.getenv("FRONTEND_URL", "http://localhost:3000").split(",")]
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
-# Trusted hosts for production
-if ENVIRONMENT == "production":
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=ALLOWED_HOSTS
-    )
 
 # Optimized compression middleware
 app.add_middleware(GZipMiddleware, minimum_size=500)  # Lower threshold for better compression
@@ -120,7 +114,7 @@ app.add_middleware(GZipMiddleware, minimum_size=500)  # Lower threshold for bett
 if ENVIRONMENT == "production":
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[FRONTEND_URL],
+        allow_origins=FRONTEND_URLS,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
@@ -136,6 +130,13 @@ else:
         allow_methods=["*"],
         allow_headers=["*"],
         max_age=3600,
+    )
+
+# Trusted hosts for production    
+if ENVIRONMENT == "production":
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=ALLOWED_HOSTS
     )
 
 # Exception handlers
