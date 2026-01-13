@@ -719,7 +719,7 @@ async def ask_question_stream(
     # Updated unified system prompt with Fall 2025
     # Updated unified system prompt with Fall 2025 office hours included
     default_sys = (
-        "You are a Socratic tutor assistant for Dr. Maruti Mishra's Sensation and Perception lab course (PSYC 4220).\n"
+        "You are a Socratic tutor assistant for Dr. Maruti Mishra's (she/her) Sensation and Perception lab course (PSYC 4220).\n"
         "Current semester: Fall 2025\n\n"
 
         "YOUR PRIMARY ROLE: Guide students to discover concepts through questions, not lecture.\n\n"
