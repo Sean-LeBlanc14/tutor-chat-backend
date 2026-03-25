@@ -1,148 +1,116 @@
-# Psychology Tutor Chatbot Backend
+# Psychology Tutor Chatbot — Backend
 
-> **Portfolio Project** - A production-ready FastAPI backend demonstrating modern software engineering practices, AI integration, and full-stack development skills.
+A production-deployed FastAPI backend powering an AI tutoring platform built for Dr. Maruti Mishra's Sensation and Perception lab course at California State University, Bakersfield. Presented as a research poster at AIxHEArt 2025 (25% acceptance rate).
 
-**Live Demo**: [Add your deployment URL here] | **Frontend Repository**: [https://github.com/Sean-LeBlanc14/tutor-chat-frontend]
-
-## 🚀 Project Overview
-
-An intelligent psychology tutoring system I built to demonstrate proficiency in backend development, AI/ML integration, and production software practices. The system uses Retrieval-Augmented Generation (RAG) to provide contextually-aware responses by searching through course materials and generating personalized tutoring responses.
-
-
-## 🎯 Key Technical Achievements
-
-- **🤖 AI Integration**: Implemented RAG architecture using Mistral AI and Pinecone vector database
-- **📊 Production Ready**: Docker containerization, health monitoring, structured logging, and CI/CD ready
-- **⚡ Performance**: Async PostgreSQL with connection pooling, optimized vector search
-- **🏗️ Clean Architecture**: Modular design, comprehensive error handling, and extensive documentation
-
-## 🛠️ Technical Stack
-
-| Category | Technologies |
-|----------|-------------|
-| **Backend** | FastAPI, Python 3.11, Pydantic |
-| **Database** | PostgreSQL, asyncpg |
-| **AI/ML** | Mistral AI API, Sentence Transformers, Pinecone Vector DB |
-| **Security** | JWT, bcrypt, rate limiting, CORS |
-| **DevOps** | Docker, Gunicorn, Uvicorn workers |
-| **Monitoring** | Prometheus metrics, structured logging |
-
-## 💡 Problem Solved
-
-Created an intelligent tutoring system that:
-- **Reduces instructor workload** by handling common student questions 24/7
-- **Provides personalized responses** using course-specific content
-- **Maintains conversation context** across multi-turn dialogues
-- **Offers admin tools** for testing different AI configurations
-
-## 🏆 Engineering Highlights
-
-### 1. **Intelligent RAG System** (`query_bot.py`)
-```python
-# Automatically categorizes questions and chooses appropriate response strategy
-def ask_question(question, system_prompt=None, temperature=0.7, chat_history=None):
-    # 1. Psychology Question: Uses RAG with course content
-    # 2. Follow-up Question: Uses conversation history only  
-    # 3. Irrelevant Question: Politely redirects
-```
-
-### 2. **Robust Database Architecture** (`db.py`)
-- Async connection pooling (2-10 connections)
-- Context managers for safe operations
-- Graceful error handling and recovery
-
-### 4. **Comprehensive Monitoring** (`monitoring.py`)
-- Health checks for all dependencies (DB, Pinecone, Mistral API)
-- Prometheus metrics collection
-- Structured logging with correlation IDs
-
-## 📊 API Design
-
-### Core Endpoints
-- `POST /api/chat` - Main tutoring interface with context awareness
-- `GET /api/chats/{user_email}` - Retrieve conversation history
-- `POST /api/auth/login` - Secure JWT authentication
-- `GET /api/health` - Comprehensive health monitoring
-
-### Admin Features
-- `POST /api/sandbox/environments` - Create custom AI configurations
-- `GET /api/sandbox/sessions` - Manage testing sessions
-
-**Example API Call:**
-```bash
-curl -X POST "http://localhost:8080/api/chat" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is cognitive dissonance?", "temperature": 0.7}'
-```
-
-## 🏗️ System Architecture
-
-```
-User Question → FastAPI → RAG System → Vector Search (Pinecone)
-                ↓              ↓
-            Database ← AI Response ← Mistral AI + Context
-```
-
-### Data Flow
-1. **Question Processing**: Categorize question type (new/follow-up/irrelevant)
-2. **Context Retrieval**: Semantic search through course materials (if needed)
-3. **Response Generation**: Mistral AI with retrieved context + conversation history
-4. **Persistence**: Save conversation for future context
-
-## 🎓 Learning Outcomes & Skills Demonstrated
-
-### Backend Development
-- **API Design**: RESTful endpoints with OpenAPI documentation
-- **Database Design**: Async operations, connection pooling, migrations
-- **Error Handling**: Comprehensive exception handling and user-friendly responses
-
-### AI/ML Engineering
-- **Vector Databases**: Semantic search implementation with Pinecone
-- **LLM Integration**: Prompt engineering and conversation context management
-- **Performance Optimization**: Caching embedding models, efficient chunking
-
-### DevOps & Production
-- **Containerization**: Multi-stage Docker builds, non-root security
-- **Monitoring**: Health checks, metrics collection, structured logging  
-- **Security**: Authentication, authorization, rate limiting, input validation
-
-### Software Engineering
-- **Clean Code**: Modular architecture, type hints, comprehensive documentation
-- **Testing**: Unit tests, integration tests, error scenario coverage
-- **Scalability**: Async programming, connection pooling, horizontal scaling ready
-
-## 📈 Metrics & Performance
-
-- **Response Time**: <2s average for complex questions
-- **Uptime**: 99.9% with health monitoring
-- **Security**: Zero known vulnerabilities, regular dependency updates
-- **Code Quality**: 95%+ test coverage, type-checked with mypy
-
-## 🔧 Technical Challenges Solved
-
-1. **Context Management**: Balancing conversation history vs. fresh information
-2. **Vector Search Optimization**: Chunking strategy for optimal retrieval
-3. **Security**: Implementing comprehensive protection without UX friction
-4. **Scalability**: Designing for university-scale deployment (1000+ students)
-
-## 🎯 Internship Relevance
-
-This project demonstrates skills directly applicable to modern software engineering roles:
-
-- **Full-Stack Thinking**: Backend designed to support rich frontend experiences
-- **Production Mindset**: Built with monitoring, security, and scalability from day one
-- **Modern Technologies**: Current industry stack (FastAPI, async Python, vector databases)
-- **AI Integration**: Practical LLM implementation beyond simple API calls
-- **Team Collaboration**: Clean code, documentation, and deployment-ready architecture
-
-## 📞 Contact
-
-**Sean LeBlanc-Grappendorf** - Computer Science Student at [Cal Poly San Luis Obispo]
-- **Email**: [seanaugustlg2006@gmail.com]
-- **LinkedIn**: [https://www.linkedin.com/in/sean-leblanc-grappendorf-6045a8331/]
-- **Portfolio**: [https://seanlg.com/]
-- **GitHub**: [https://github.com/Sean-LeBlanc14]
+**Frontend Repository:** [tutor-chat-frontend](https://github.com/Sean-LeBlanc14/tutor-chat-frontend)
 
 ---
 
-*Built with 💻 and ☕ for learning and real-world impact*
+## Overview
+
+An intelligent tutoring system that uses Retrieval-Augmented Generation (RAG) to answer student questions using course-specific materials. The system distinguishes between conceptual questions (answered via Socratic method) and administrative questions (answered directly), routing each to the appropriate response strategy.
+
+---
+
+## Technical Stack
+
+| Category | Technologies |
+|---|---|
+| Backend | FastAPI, Python 3.11, Pydantic |
+| Database | PostgreSQL, asyncpg (connection pooling) |
+| AI/ML | vLLM (AsyncLLMEngine), Llama 3.1 8B Instruct, Sentence Transformers (multi-qa-mpnet-base-dot-v1), FAISS |
+| Security | JWT (httpOnly cookies), bcrypt, IP-based rate limiting, CORS, TrustedHost middleware |
+| DevOps | Docker (multi-stage, non-root), Uvicorn, Gunicorn |
+| Monitoring | Prometheus metrics, psutil, structured logging |
+
+---
+
+## Architecture
+
+```
+User Question
+     |
+     v
+FastAPI (rate limiting, auth middleware)
+     |
+     v
+Question Classifier (conceptual / administrative / casual / off-topic)
+     |
+     +---> RAG Pipeline (if needed)
+     |          |
+     |          v
+     |     Sentence Transformers --> FAISS vector search --> course material chunks
+     |
+     v
+Dynamic token budgeting (context window management)
+     |
+     v
+vLLM AsyncLLMEngine --> Llama 3.1 8B (GPU-accelerated)
+     |
+     v
+SSE stream --> Frontend
+     |
+     v
+PostgreSQL (persist chat history via asyncpg)
+```
+
+---
+
+## Key Engineering Details
+
+### RAG Pipeline
+
+Questions are classified into types (conceptual, administrative, casual, test question) before retrieval. Administrative questions (office hours, deadlines, grades) trigger direct retrieval from course syllabi. Conceptual questions use semantic search via FAISS with `multi-qa-mpnet-base-dot-v1` embeddings, with adaptive `k` depending on question complexity.
+
+Lab queries use an enhanced retrieval path that appends semantic keywords before embedding to improve chunk recall for course-specific terminology.
+
+### Dynamic Token Budgeting
+
+Each request dynamically allocates the available context window across the system prompt, RAG context, and chat history. Token counts are computed using the model's HuggingFace tokenizer, with binary trimming applied if the prompt exceeds the budget. This prevents context overflow at classroom scale without sacrificing response quality.
+
+### Async Concurrency
+
+The backend uses vLLM's `AsyncLLMEngine` for true async inference — requests are processed concurrently rather than queued behind a blocking model call. A custom `RequestQueue` manages up to 25 concurrent requests with a queue depth of 75, designed for simultaneous classroom use.
+
+### Authentication
+
+JWT tokens are issued on login and stored in httpOnly cookies, preventing JavaScript access and protecting against XSS. All authenticated routes verify the token via a `/api/me` session check on page load.
+
+### Socratic Tutoring System
+
+The system prompt encodes a full decision tree: administrative questions receive direct answers from context, while conceptual questions always use the Socratic method regardless of whether the answer is available. The prompt includes a progression pattern (broad question → focused question → concept connection → hint) and handles student frustration gracefully.
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/chat/stream` | Main tutoring interface (SSE streaming) |
+| GET | `/api/chats/{user_email}` | Retrieve conversation history |
+| POST | `/api/auth/login` | JWT authentication |
+| POST | `/api/auth/signup` | User registration |
+| GET | `/api/me` | Session verification |
+| GET | `/api/health` | Health check (DB, model, GPU, system) |
+| GET | `/api/metrics` | Prometheus + system metrics |
+| POST | `/api/sandbox/environments` | Create custom AI configurations (admin) |
+| GET | `/api/sandbox/sessions/{env_id}` | Manage sandbox sessions (admin) |
+
+---
+
+## Deployment
+
+The backend is containerized using a multi-stage Docker build with a non-root user for security. It runs as a single Uvicorn worker (required for GPU memory sharing) with uvloop and httptools for production performance. FAISS index files (`faiss_index.bin`, `faiss_metadata.pkl`) are built separately via `embed_chunks.py` and copied into the container at build time.
+
+GPU support requires CUDA 12.x. CPU fallback uses a smaller HuggingFace model via Transformers for development environments.
+
+---
+
+## Contact
+
+**Sean LeBlanc-Grappendorf** — CS Student, Cal Poly San Luis Obispo
+
+- Email: seanaugustlg2006@gmail.com
+- LinkedIn: [linkedin.com/in/sean-leblanc-grappendorf-6045a8331](https://www.linkedin.com/in/sean-leblanc-grappendorf-6045a8331/)
+- Portfolio: [seanlg.com](https://seanlg.com/)
+- GitHub: [github.com/Sean-LeBlanc14](https://github.com/Sean-LeBlanc14)
